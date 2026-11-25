@@ -1,0 +1,1846 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { open, save, message, ask } from "@tauri-apps/plugin-dialog";
+import {
+  api,
+  cellSortKey,
+  fmtCell,
+  type BrowserGroup,
+  type CaseInfo,
+  type HtmlItem,
+  type KwItem,
+  type MediaItem,
+  type Overview,
+  type ReportOptions,
+  type Row,
+  type SubItem,
+  type TagEntry,
+} from "./api";
+
+type Selection =
+  | { kind: "cat"; ai: number; ci: number }
+  | { kind: "timeline" }
+  | { kind: "domains" }
+  | { kind: "search"; term: string }
+  | { kind: "flagged"; browser: string | null }
+  | { kind: "search_terms" }
+  | { kind: "stats" }
+  | { kind: "ga" }
+  | { kind: "histogram" }
+  | { kind: "online" }
+  | { kind: "keywords" }
+  | { kind: "identity" }
+  | { kind: "downloads" }
+  | { kind: "geolocation" }
+  | { kind: "vpn" }
+  | { kind: "media" }
+  | { kind: "html" }
+  | { kind: "tags" };
+
+interface KwList {
+  name: string;
+  words: string[];
+}
+
+const BROWSER_PRESETS = [
+  "Google Chrome",
+  "Microsoft Edge",
+  "Brave",
+  "Opera",
+  "Vivaldi",
+  "Chromium",
+  "Firefox",
+  "Safari",
+  "Internet Explorer / Edge Legacy",
+];
+
+const DEFAULT_REPORT_OPTS: ReportOptions = {
+  only_tagged: false,
+  include_tags: true,
+  include_stats: true,
+  include_histogram: true,
+  include_timeline: true,
+  include_domains: true,
+  include_terms: true,
+  include_ga: true,
+  include_online: true,
+  include_flagged: true,
+  include_details: true,
+  include_identity: true,
+  include_downloads: true,
+  include_geolocation: true,
+  include_vpn: true,
+};
+
+// listes de mots-clés forensiques par défaut (l'utilisateur peut les éditer)
+const DEFAULT_KW_LISTS: KwList[] = [
+  { name: "Anonymat / Dark web", words: ["onion", "tor browser", "tails", "i2p", "vpn", "proxy", "monero", "mixer", "tumbler", "dread", "hidden service"] },
+  { name: "Stockage & partage", words: ["mega.nz", "dropbox", "wetransfer", "torrent", "magnet:", "utorrent", "qbittorrent", "uptobox", "1fichier", "rapidgator"] },
+  { name: "Piratage / outils", words: ["crack", "keygen", "serial", "warez", "nulled", "exploit", "malware", "keylogger", "phishing", "metasploit", "cobalt strike"] },
+  { name: "Paiement / fraude", words: ["carding", "cvv", "fullz", "bank log", "skimmer", "dumps", "western union"] },
+  { name: "Messageries chiffrées", words: ["signal", "telegram", "wickr", "threema", "session messenger", "protonmail", "tutanota"] },
+  { name: "Armes", words: ["arme", "pistolet", "munition", "silencieux", "glock", "kalachnikov"] },
+  { name: "Stupéfiants", words: ["cannabis", "cocaine", "mdma", "ecstasy", "heroine", "lsd", "amphetamine", "stupefiant"] },
+];
+
+function loadKwLists(): KwList[] {
+  try {
+    const raw = localStorage.getItem("nf_kwlists");
+    if (raw) return JSON.parse(raw);
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_KW_LISTS;
+}
+
+interface View {
+  title: string;
+  sha: string;
+  columns: string[];
+  rows: Row[];
+}
+
+const THEMES = ["sombre", "clair", "contraste"] as const;
+const TAG_PRESETS: { name: string; color: string }[] = [
+  { name: "À retenir", color: "#f59e0b" },
+  { name: "Preuve", color: "#ef4444" },
+  { name: "Suspect", color: "#a855f7" },
+  { name: "À écarter", color: "#64748b" },
+  { name: "À vérifier", color: "#3b82f6" },
+];
+
+const HELP_LOCATIONS: { b: string; win: string; other: string }[] = [
+  {
+    b: "Chrome",
+    win: "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default",
+    other: "macOS : ~/Library/Application Support/Google/Chrome/Default · Linux : ~/.config/google-chrome/Default",
+  },
+  {
+    b: "Edge (Chromium)",
+    win: "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default",
+    other: "macOS : ~/Library/Application Support/Microsoft Edge/Default",
+  },
+  {
+    b: "Brave",
+    win: "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default",
+    other: "Linux : ~/.config/BraveSoftware/Brave-Browser/Default",
+  },
+  {
+    b: "Opera",
+    win: "%APPDATA%\\Opera Software\\Opera Stable",
+    other: "macOS : ~/Library/Application Support/com.operasoftware.Opera",
+  },
+  {
+    b: "Vivaldi",
+    win: "%LOCALAPPDATA%\\Vivaldi\\User Data\\Default",
+    other: "",
+  },
+  {
+    b: "Firefox",
+    win: "%APPDATA%\\Mozilla\\Firefox\\Profiles\\<id>.default-release",
+    other: "macOS : ~/Library/Application Support/Firefox/Profiles · Linux : ~/.mozilla/firefox",
+  },
+  {
+    b: "Safari",
+    win: "— (macOS uniquement)",
+    other: "macOS : ~/Library/Safari (History.db, Bookmarks.plist, Downloads.plist)",
+  },
+  {
+    b: "IE / Edge Legacy",
+    win: "%LOCALAPPDATA%\\Microsoft\\Windows\\WebCache\\WebCacheV01.dat",
+    other: "",
+  },
+];
+
+// fichiers clés à fournir par navigateur
+const HELP_FILES =
+  "Chromium (Chrome/Edge/Brave/Opera/Vivaldi) : History, Cookies (ou Network\\Cookies), Web Data, Login Data, Bookmarks, Shortcuts, Top Sites, Favicons, Preferences. " +
+  "Firefox : places.sqlite, cookies.sqlite, formhistory.sqlite, logins.json, favicons.sqlite, sessionstore.jsonlz4. " +
+  "Safari : History.db, Bookmarks.plist, Downloads.plist. IE/Edge Legacy : WebCacheV01.dat.";
+
+// signature stable d'une ligne (independante du fuseau), pour le marquage
+function rowSig(r: Row, columns: string[]): string {
+  return columns
+    .map((c) => {
+      const cell = r.values[c];
+      if (!cell || cell.t === "null") return "";
+      return `${cell.t}:${"v" in cell ? cell.v : ""}`;
+    })
+    .join("␟");
+}
+function rowSummary(r: Row, columns: string[], tz: string): string {
+  return columns
+    .slice(0, 3)
+    .map((c) => fmtCell(r.values[c], tz))
+    .filter(Boolean)
+    .join(" — ")
+    .slice(0, 200);
+}
+function cellText(c: Row["values"][string] | undefined): string {
+  return c && c.t === "text" ? c.v : "";
+}
+// pastille navigateur (couleur de marque + initiale) — pas de logo (droits)
+function browserBadge(name: string): { bg: string; ch: string } {
+  const n = name.toLowerCase();
+  if (n.includes("chrome")) return { bg: "#4285F4", ch: "C" };
+  if (n.includes("edge legacy") || n.includes("internet explorer"))
+    return { bg: "#1EBBEE", ch: "e" };
+  if (n.includes("edge")) return { bg: "#0E7FC1", ch: "E" };
+  if (n.includes("firefox")) return { bg: "#FF7139", ch: "F" };
+  if (n.includes("brave")) return { bg: "#FB542B", ch: "B" };
+  if (n.includes("opera")) return { bg: "#FF1B2D", ch: "O" };
+  if (n.includes("vivaldi")) return { bg: "#EF3939", ch: "V" };
+  if (n.includes("safari")) return { bg: "#1B88CA", ch: "S" };
+  if (n.includes("chromium")) return { bg: "#6E7D8A", ch: "c" };
+  return { bg: "#64748b", ch: "?" };
+}
+// identité d'une ligne pour le marquage : signature réelle portée par la ligne
+// (vue « Éléments marqués ») sinon signature calculée depuis ses valeurs
+function sigOf(r: Row, columns: string[]): string {
+  const s = r.values["_sig"];
+  if (s && s.t === "text") return s.v;
+  return rowSig(r, columns);
+}
+// millisecondes d'une ligne = premiere cellule de type temps
+function rowTimeMs(r: Row): number | null {
+  for (const k in r.values) {
+    const cell = r.values[k];
+    if (cell && cell.t === "time") return cell.v;
+  }
+  return null;
+}
+
+export function App() {
+  const [over, setOver] = useState<Overview[]>([]);
+  const [groups, setGroups] = useState<BrowserGroup[]>([]);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [sel, setSel] = useState<Selection | null>(null);
+  const [view, setView] = useState<View | null>(null);
+  const [theme, setTheme] = useState<string>("sombre");
+  const [tz, setTz] = useState<string>("UTC");
+  const [noisy, setNoisy] = useState<boolean>(false);
+  const [filter, setFilter] = useState<string>("");
+  const [dateFrom, setDateFrom] = useState<string>("");
+  const [dateTo, setDateTo] = useState<string>("");
+  const [tags, setTags] = useState<TagEntry[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; row: Row } | null>(null);
+  const [tagModalRows, setTagModalRows] = useState<Row[] | null>(null);
+  const [kwLists, setKwLists] = useState<KwList[]>(loadKwLists);
+  const [kwQuery, setKwQuery] = useState<KwItem[]>([]);
+  const [showKw, setShowKw] = useState<boolean>(false);
+  const [kwSel, setKwSel] = useState<number>(0);
+  const [showReportOpts, setShowReportOpts] = useState<boolean>(false);
+  const [reportOpts, setReportOpts] = useState<ReportOptions>(DEFAULT_REPORT_OPTS);
+  // Éléments d'identité retenus (sélectionnés) pour insertion dans le rapport.
+  const [identityPick, setIdentityPick] = useState<Record<string, string>[]>([]);
+  // Menu déroulant « Export » (CSV / XLSX / Rapport).
+  const [showExport, setShowExport] = useState<boolean>(false);
+  const [media, setMedia] = useState<MediaItem[]>([]);
+  const [zoomMedia, setZoomMedia] = useState<MediaItem | null>(null);
+  const [htmls, setHtmls] = useState<HtmlItem[]>([]);
+  const [htmlView, setHtmlView] = useState<HtmlItem | null>(null);
+  const [gsearch, setGsearch] = useState<string>("");
+  const [sortCol, setSortCol] = useState<string | null>(null);
+  const [sortAsc, setSortAsc] = useState<boolean>(true);
+  const [detail, setDetail] = useState<Row | null>(null);
+  const [tagLabel, setTagLabel] = useState<string>(TAG_PRESETS[0].name);
+  const [tagColor, setTagColor] = useState<string>(TAG_PRESETS[0].color);
+  const [tagNote, setTagNote] = useState<string>("");
+  const [showCase, setShowCase] = useState<boolean>(false);
+  const [showHelp, setShowHelp] = useState<boolean>(false);
+  const [showSources, setShowSources] = useState<boolean>(false);
+  const [browserDraft, setBrowserDraft] = useState<Record<number, string>>({});
+  const [appVersion, setAppVersion] = useState<string>("");
+  const [caseInfo, setCaseInfo] = useState<CaseInfo>({
+    numero: "",
+    examinateur: "",
+    service: "",
+    notes: "",
+  });
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
+
+  const refreshOverview = useCallback(async () => {
+    try {
+      const [ov, gr] = await Promise.all([api.overview(), api.browserGroups()]);
+      setOver(ov);
+      setGroups(gr);
+    } catch (e) {
+      const txt = e instanceof Error ? e.message : String(e);
+      await message(txt, { title: "NavForensics — erreur", kind: "error" });
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshOverview();
+    api.listTags().then(setTags).catch(() => {});
+    api.version().then(setAppVersion).catch(() => {});
+  }, [refreshOverview]);
+
+  // index des signatures marquees + acces par signature
+  const tagBySig = useMemo(() => {
+    const m = new Map<string, TagEntry>();
+    for (const t of tags) m.set(t.sig, t);
+    return m;
+  }, [tags]);
+
+  // persistance des listes de mots-cles
+  useEffect(() => {
+    try {
+      localStorage.setItem("nf_kwlists", JSON.stringify(kwLists));
+    } catch {
+      /* ignore */
+    }
+  }, [kwLists]);
+
+  // reinitialise la selection et ferme le menu contextuel en changeant de vue
+  useEffect(() => {
+    setSelected(new Set());
+    setCtxMenu(null);
+  }, [sel]);
+
+  const loadView = useCallback(async () => {
+    if (!sel) {
+      setView(null);
+      return;
+    }
+    setSortCol(null);
+    try {
+      if (sel.kind === "cat") {
+        const c = await api.category(sel.ai, sel.ci);
+        if (c) {
+          setView({
+            title: `${over[sel.ai]?.evidence ?? ""} — ${c.name}`,
+            sha: over[sel.ai]?.sha256 ?? "",
+            columns: c.columns,
+            rows: c.rows,
+          });
+        }
+      } else if (sel.kind === "timeline") {
+        const v = await api.timeline(noisy);
+        setView({ title: "Timeline unifiée", sha: "— (fusion)", ...v });
+      } else if (sel.kind === "domains") {
+        const v = await api.domains(noisy);
+        setView({ title: "Regroupement par domaine", sha: "—", ...v });
+      } else if (sel.kind === "search") {
+        const v = await api.search(sel.term);
+        setView({ title: `Recherche : « ${sel.term} »`, sha: "—", ...v });
+      } else if (sel.kind === "flagged") {
+        const v = await api.flagged(sel.browser);
+        setView({
+          title: sel.browser
+            ? `Liens signalés — ${sel.browser}`
+            : "Liens signalés — tous navigateurs",
+          sha: "—",
+          ...v,
+        });
+      } else if (sel.kind === "search_terms") {
+        const v = await api.searchTerms();
+        setView({ title: "Termes recherchés", sha: "—", ...v });
+      } else if (sel.kind === "stats") {
+        const v = await api.stats();
+        setView({ title: "Statistiques", sha: "—", ...v });
+      } else if (sel.kind === "ga") {
+        const v = await api.gaCookies();
+        setView({ title: "Cookies Google Analytics", sha: "—", ...v });
+      } else if (sel.kind === "histogram") {
+        const v = await api.histogram();
+        setView({ title: "Histogramme d'activité (UTC)", sha: "—", ...v });
+      } else if (sel.kind === "media" || sel.kind === "html") {
+        setView(null); // galerie / pages HTML rendues séparément
+      } else if (sel.kind === "online") {
+        const v = await api.onlineServices();
+        setView({ title: "Services en ligne (cloud / webmail / réseaux)", sha: "—", ...v });
+      } else if (sel.kind === "identity") {
+        const v = await api.identity();
+        setView({ title: "Éléments d'identité (autofill)", sha: "—", ...v });
+      } else if (sel.kind === "downloads") {
+        const v = await api.downloads();
+        setView({ title: "Téléchargements", sha: "—", ...v });
+      } else if (sel.kind === "geolocation") {
+        const v = await api.geolocation();
+        setView({ title: "Géolocalisations / adresses recherchées", sha: "—", ...v });
+      } else if (sel.kind === "vpn") {
+        const v = await api.vpn();
+        setView({ title: "VPN / anonymiseurs", sha: "—", ...v });
+      } else if (sel.kind === "keywords") {
+        const v = await api.keywordSearch(kwQuery);
+        setView({
+          title: `Recherche par mots-clés (${kwQuery.length} termes)`,
+          sha: "—",
+          ...v,
+        });
+      } else if (sel.kind === "tags") {
+        const columns = [
+          "Marqueur",
+          "Navigateur",
+          "Source (chemin)",
+          "Modifié",
+          "Taille",
+          "Élément",
+          "Note",
+          "Date",
+        ];
+        const rows: Row[] = tags.map((t) => ({
+          values: {
+            Marqueur: { t: "text", v: t.label },
+            Navigateur: { t: "text", v: t.browser },
+            "Source (chemin)": { t: "text", v: t.path },
+            Modifié: t.modified != null ? { t: "time", v: t.modified } : { t: "null" },
+            Taille: t.size != null ? { t: "int", v: t.size } : { t: "null" },
+            Élément: { t: "text", v: t.summary },
+            Note: { t: "text", v: t.note },
+            Date: { t: "text", v: t.when },
+            _sig: { t: "text", v: t.sig },
+            _couleur: { t: "text", v: t.color },
+          },
+          raw: [],
+        }));
+        setView({ title: `Éléments marqués (${tags.length})`, sha: "—", columns, rows });
+      }
+    } catch (e) {
+      const txt = e instanceof Error ? e.message : String(e);
+      await message(txt, { title: "NavForensics — erreur", kind: "error" });
+    }
+  }, [sel, noisy, over, tags, kwQuery]);
+
+  useEffect(() => {
+    loadView();
+  }, [loadView]);
+
+  // pre-remplit le marqueur/la note a l'ouverture du detail d'une ligne
+  useEffect(() => {
+    if (detail && view) {
+      const ex = tagBySig.get(sigOf(detail, view.columns));
+      setTagLabel(ex?.label ?? TAG_PRESETS[0].name);
+      setTagColor(ex?.color ?? TAG_PRESETS[0].color);
+      setTagNote(ex?.note ?? "");
+    }
+  }, [detail, view, tagBySig]);
+
+  // affiche toute erreur backend au lieu de laisser la promesse echouer en silence
+  const reportError = async (e: unknown) => {
+    const txt = e instanceof Error ? e.message : String(e);
+    await message(txt, { title: "NavForensics — erreur", kind: "error" });
+  };
+
+  const summary = async (s: { loaded: number; errors: string[] }) => {
+    let msg = `${s.loaded} base(s) chargée(s).`;
+    if (s.errors.length) {
+      msg += `\n\n${s.errors.length} ignorée(s) :\n` + s.errors.slice(0, 12).join("\n");
+      await message(msg, { title: "NavForensics", kind: "warning" });
+    }
+  };
+
+  const addFiles = async () => {
+    try {
+      const picked = await open({ multiple: true, title: "Bases de navigateur" });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      await summary(await api.addPaths(paths));
+      await refreshOverview();
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const addFolder = async () => {
+    try {
+      const dir = await open({ directory: true, title: "Dossier à scanner" });
+      if (!dir || Array.isArray(dir)) return;
+      await summary(await api.addFolder(dir));
+      await refreshOverview();
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const addCache = async () => {
+    try {
+      const dir = await open({ directory: true, title: "Dossier de cache (carving)" });
+      if (!dir || Array.isArray(dir)) return;
+      await summary(await api.addCache(dir));
+      await refreshOverview();
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const autodetectRun = async () => {
+    try {
+      await summary(await api.autodetect());
+      await refreshOverview();
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const applyBrowser = async (ai: number) => {
+    const val = (browserDraft[ai] ?? over[ai]?.browser ?? "").trim();
+    if (!val) return;
+    try {
+      await api.setBrowser(ai, val);
+      await refreshOverview();
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const loadMedia = async () => {
+    try {
+      const dir = await open({
+        directory: true,
+        title: "Dossier de cache / profil (images & vidéos)",
+      });
+      if (!dir || Array.isArray(dir)) return;
+      const [items, pages] = await Promise.all([api.cacheMedia(dir), api.cacheHtml(dir)]);
+      setMedia(items);
+      setHtmls(pages);
+      setSel({ kind: items.length > 0 ? "media" : "html" });
+      if (items.length === 0 && pages.length === 0)
+        await message("Aucune image, vidéo ou page HTML détectée dans ce dossier.", {
+          title: "NavForensics",
+        });
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const saveMediaItem = async (m: MediaItem) => {
+    try {
+      const ext = m.mime.split("/")[1] || "bin";
+      const path = await save({
+        defaultPath: m.name + "." + ext,
+        filters: [{ name: m.mime, extensions: [ext] }],
+      });
+      if (!path) return;
+      await api.saveMedia(path, m.data);
+      await message("Média exporté : " + path, { title: "NavForensics" });
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const clearAll = async () => {
+    try {
+      const ok = await ask("Vider tous les éléments chargés ?", {
+        title: "Confirmation",
+        kind: "warning",
+      });
+      if (!ok) return;
+      await api.clear();
+      setSel(null);
+      setView(null);
+      await refreshOverview();
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+
+  const runSearch = () => {
+    const t = gsearch.trim();
+    if (t) setSel({ kind: "search", term: t });
+  };
+
+  const openItem = (it: SubItem) => {
+    if (it.kind === "cat" && it.ai !== null && it.ci !== null) {
+      setSel({ kind: "cat", ai: it.ai, ci: it.ci });
+    } else if (it.kind === "flagged") {
+      setSel({ kind: "flagged", browser: it.browser });
+    }
+  };
+
+  // filtre + tri cote client
+  const displayed = useMemo<Row[]>(() => {
+    if (!view) return [];
+    let rows = view.rows;
+    const f = filter.trim().toLowerCase();
+    if (f) {
+      rows = rows.filter((r) =>
+        view.columns.some((c) => fmtCell(r.values[c], tz).toLowerCase().includes(f))
+      );
+    }
+    // filtre par plage de dates (UTC) ; les lignes sans date sont conservees
+    const fromMs = dateFrom ? Date.parse(dateFrom + "T00:00:00Z") : null;
+    const toMs = dateTo ? Date.parse(dateTo + "T23:59:59.999Z") : null;
+    if (fromMs !== null || toMs !== null) {
+      rows = rows.filter((r) => {
+        const ms = rowTimeMs(r);
+        if (ms === null) return true;
+        if (fromMs !== null && ms < fromMs) return false;
+        if (toMs !== null && ms > toMs) return false;
+        return true;
+      });
+    }
+    if (sortCol) {
+      rows = [...rows].sort((a, b) => {
+        const ka = cellSortKey(a.values[sortCol]);
+        const kb = cellSortKey(b.values[sortCol]);
+        let r = 0;
+        if (ka < kb) r = -1;
+        else if (ka > kb) r = 1;
+        return sortAsc ? r : -r;
+      });
+    }
+    return rows;
+  }, [view, filter, tz, sortCol, sortAsc, dateFrom, dateTo]);
+
+  // largeurs par defaut (selon le nom de colonne)
+  const defaultWidths = useMemo<number[]>(() => {
+    if (!view) return [];
+    return view.columns.map((c) => Math.min(Math.max(c.length * 9, 110), 420));
+  }, [view]);
+
+  // largeurs effectives, redimensionnables par l'utilisateur
+  const [colW, setColW] = useState<number[]>([]);
+  useEffect(() => {
+    setColW(defaultWidths);
+  }, [defaultWidths]);
+  const widths = colW.length === defaultWidths.length ? colW : defaultWidths;
+  const totalWidth = useMemo(() => widths.reduce((a, b) => a + b, 0), [widths]);
+
+  // glisser le bord droit d'un en-tete pour redimensionner la colonne
+  const resizing = useRef<{ idx: number; startX: number; startW: number } | null>(null);
+  const onResizeMove = useCallback((e: MouseEvent) => {
+    const r = resizing.current;
+    if (!r) return;
+    const w = Math.max(50, r.startW + (e.clientX - r.startX));
+    setColW((prev) => {
+      const base = prev.slice();
+      base[r.idx] = w;
+      return base;
+    });
+  }, []);
+  const onResizeEnd = useCallback(() => {
+    resizing.current = null;
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    window.removeEventListener("mousemove", onResizeMove);
+    window.removeEventListener("mouseup", onResizeEnd);
+  }, [onResizeMove]);
+  const onResizeStart = useCallback(
+    (e: React.MouseEvent, idx: number) => {
+      e.preventDefault();
+      e.stopPropagation();
+      resizing.current = { idx, startX: e.clientX, startW: widths[idx] ?? 120 };
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      window.addEventListener("mousemove", onResizeMove);
+      window.addEventListener("mouseup", onResizeEnd);
+    },
+    [widths, onResizeMove, onResizeEnd]
+  );
+  // double-clic sur la poignee : revenir a la largeur par defaut
+  const onResizeReset = useCallback(
+    (e: React.MouseEvent, idx: number) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setColW((prev) => {
+        const base = prev.length ? prev.slice() : defaultWidths.slice();
+        base[idx] = defaultWidths[idx];
+        return base;
+      });
+    },
+    [defaultWidths]
+  );
+
+  const rowVirt = useVirtualizer({
+    count: displayed.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 24,
+    overscan: 20,
+  });
+  const vItems = rowVirt.getVirtualItems();
+  const padTop = vItems.length ? vItems[0].start : 0;
+  const padBottom = vItems.length
+    ? rowVirt.getTotalSize() - vItems[vItems.length - 1].end
+    : 0;
+
+  // revenir en haut quand le filtre / la vue / le tri change (sinon la plage
+  // virtualisee peut rester au-dela des lignes filtrees et n'afficher rien)
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+    rowVirt.scrollToOffset(0);
+  }, [filter, sel, sortCol, sortAsc, dateFrom, dateTo, rowVirt]);
+
+  const toggleSort = (c: string) => {
+    if (sortCol === c) setSortAsc((v) => !v);
+    else {
+      setSortCol(c);
+      setSortAsc(true);
+    }
+  };
+
+  const exportTable = async (format: "csv" | "xlsx") => {
+    if (!view || !sel) return;
+    if (sel.kind === "tags" || sel.kind === "keywords") {
+      await message(
+        "Export direct non disponible pour cette vue. Utilisez le rapport HTML (éléments marqués) ou une autre vue.",
+        { title: "NavForensics" }
+      );
+      return;
+    }
+    try {
+      const path = await save({
+        filters: [{ name: format.toUpperCase(), extensions: [format] }],
+      });
+      if (!path) return;
+      if (sel.kind === "cat") {
+        await api.exportCategory(sel.ai, sel.ci, path, tz, format);
+      } else {
+        const term =
+          sel.kind === "search"
+            ? sel.term
+            : sel.kind === "flagged"
+            ? sel.browser
+            : null;
+        await api.exportView(sel.kind, term, noisy, path, tz, format);
+      }
+      const h = await api.sha256Of(path).catch(() => "");
+      await message(`Export terminé : ${path}${h ? "\n\nSHA-256 : " + h : ""}`, {
+        title: "NavForensics",
+      });
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const exportReport = async (format: "html" | "pdf" = "html") => {
+    try {
+      const ext = format === "pdf" ? "pdf" : "html";
+      const path = await save({
+        filters: [{ name: format.toUpperCase(), extensions: [ext] }],
+      });
+      if (!path) return;
+      if (format === "pdf") {
+        await api.exportReportPdf(path, tz, noisy, caseInfo, reportOpts, identityPick);
+      } else {
+        await api.exportReport(path, tz, noisy, caseInfo, reportOpts, identityPick);
+      }
+      setShowReportOpts(false);
+      const h = await api.sha256Of(path).catch(() => "");
+      await message(`Rapport généré : ${path}${h ? "\n\nSHA-256 : " + h : ""}`, {
+        title: "NavForensics",
+      });
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+
+  // --- multi-sélection, menu contextuel, multi-tag ---
+  const rowUrl = (r: Row): string => {
+    const cell = r.values["URL"];
+    return cell && cell.t === "text" ? cell.v : "";
+  };
+  const copyUrls = async (rows: Row[]) => {
+    const urls = rows.map(rowUrl).filter(Boolean);
+    try {
+      await navigator.clipboard.writeText(urls.join("\n"));
+    } catch {
+      /* clipboard indisponible */
+    }
+    setCtxMenu(null);
+  };
+  // source (navigateur, chemin, date de modif, taille) d'une ligne à marquer
+  const sourceForRow = (
+    r: Row
+  ): { browser: string; path: string; modified: number | null; size: number | null } => {
+    if (sel?.kind === "cat") {
+      const o = over[sel.ai];
+      if (o) return { browser: o.browser, path: o.path, modified: o.modified, size: o.size };
+    }
+    const browser = cellText(r.values["Navigateur"]);
+    const srcLabel = cellText(r.values["Source"]) || cellText(r.values["Scelle"]);
+    const o =
+      over.find((x) => x.evidence === srcLabel) ||
+      (srcLabel ? over.find((x) => srcLabel.includes(x.evidence)) : undefined);
+    if (o) return { browser: browser || o.browser, path: o.path, modified: o.modified, size: o.size };
+    return { browser, path: "", modified: null, size: null };
+  };
+  const applyTagToRows = async (rows: Row[]) => {
+    if (!view || rows.length === 0) return;
+    try {
+      const now = new Date().toISOString();
+      const entries: TagEntry[] = rows.map((r) => {
+        const src = sourceForRow(r);
+        return {
+          sig: sigOf(r, view.columns),
+          label: tagLabel,
+          color: tagColor,
+          note: tagNote,
+          context: view.title,
+          summary: rowSummary(r, view.columns, tz),
+          when: now,
+          browser: src.browser,
+          path: src.path,
+          modified: src.modified,
+          size: src.size,
+        };
+      });
+      await api.setTags(entries);
+      await refreshTags();
+      setTagModalRows(null);
+      setDetail(null);
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const untagRows = async (sigs: string[]) => {
+    try {
+      await api.removeTags(sigs);
+      await refreshTags();
+      setCtxMenu(null);
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  // ouvre le menu contextuel ; si la ligne n'est pas dans la sélection, elle la remplace
+  const openCtx = (e: React.MouseEvent, r: Row) => {
+    e.preventDefault();
+    if (!view) return;
+    const sig = sigOf(r, view.columns);
+    if (!selected.has(sig)) setSelected(new Set([sig]));
+    setCtxMenu({ x: e.clientX, y: e.clientY, row: r });
+  };
+  const toggleSelect = (e: React.MouseEvent, r: Row) => {
+    if (!view) return;
+    const sig = sigOf(r, view.columns);
+    setSelected((prev) => {
+      const next = e.ctrlKey || e.metaKey ? new Set(prev) : new Set<string>();
+      if (next.has(sig)) next.delete(sig);
+      else next.add(sig);
+      return next;
+    });
+  };
+  // lignes couramment sélectionnées (objets Row) dans la vue filtrée
+  const selectedRows = (): Row[] => {
+    if (!view) return [];
+    return displayed.filter((r) => selected.has(sigOf(r, view.columns)));
+  };
+
+  // Convertit une ligne (vue courante) en map colonne→texte affiché,
+  // pour l'envoyer au moteur comme élément d'identité retenu.
+  const rowToStrMap = (r: Row): Record<string, string> => {
+    const m: Record<string, string> = {};
+    if (!view) return m;
+    for (const c of view.columns) m[c] = fmtCell(r.values[c], tz);
+    return m;
+  };
+
+  // Ajoute au rapport les éléments d'identité sélectionnés (sans doublon).
+  const addIdentityToReport = (rows: Row[]) => {
+    const maps = rows.map(rowToStrMap);
+    setIdentityPick((prev) => {
+      const seen = new Set(prev.map((m) => JSON.stringify(m)));
+      const add = maps.filter((m) => !seen.has(JSON.stringify(m)));
+      return [...prev, ...add];
+    });
+  };
+
+  const runKeywordSearch = (items: KwItem[]) => {
+    setKwQuery(items);
+    setSel({ kind: "keywords" });
+    setShowKw(false);
+  };
+
+  // --- marquage / annotation ---
+  const refreshTags = async () => {
+    try {
+      setTags(await api.listTags());
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const applyTag = async () => {
+    if (!detail || !view) return;
+    try {
+      const src = sourceForRow(detail);
+      await api.setTag({
+        sig: sigOf(detail, view.columns),
+        label: tagLabel,
+        color: tagColor,
+        note: tagNote,
+        context: view.title,
+        summary: rowSummary(detail, view.columns, tz),
+        when: new Date().toISOString(),
+        browser: src.browser,
+        path: src.path,
+        modified: src.modified,
+        size: src.size,
+      });
+      await refreshTags();
+      setDetail(null);
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const clearTag = async () => {
+    if (!detail || !view) return;
+    try {
+      await api.removeTag(sigOf(detail, view.columns));
+      await refreshTags();
+      setDetail(null);
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const saveTagsFile = async () => {
+    try {
+      const path = await save({
+        filters: [{ name: "JSON", extensions: ["json"] }],
+        defaultPath: "marquages_navforensics.json",
+      });
+      if (!path) return;
+      await api.saveTags(path);
+      await message("Marquages enregistrés : " + path, { title: "NavForensics" });
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+  const loadTagsFile = async () => {
+    try {
+      const picked = await open({
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+        title: "Charger des marquages",
+      });
+      if (!picked || Array.isArray(picked)) return;
+      setTags(await api.loadTags(picked));
+      await message("Marquages chargés.", { title: "NavForensics" });
+    } catch (e) {
+      await reportError(e);
+    }
+  };
+
+  return (
+    <div className="app">
+      <div className="toolbar">
+        <button className="btn" onClick={addFiles}>➕ Fichiers</button>
+        <button className="btn" onClick={addFolder}>📁 Dossier</button>
+        <button className="btn" onClick={autodetectRun} title="Détecter et charger les profils des navigateurs de cette machine">🔎 Auto-détection</button>
+        <button className="btn" onClick={addCache}>🧩 Cache</button>
+        <button className="btn" onClick={loadMedia} title="Images, vidéos et pages HTML en cache">🖼 Cache média/HTML</button>
+        <button className="btn" onClick={clearAll}>🗑 Vider</button>
+        <div className="sep" />
+        <div className="dropdown">
+          <button className="btn" onClick={() => setShowExport((v) => !v)}>
+            ⬇ Export ▾
+          </button>
+          {showExport && (
+            <div className="dropmenu" onMouseLeave={() => setShowExport(false)}>
+              <div
+                className="dropitem"
+                onClick={() => {
+                  setShowExport(false);
+                  exportTable("csv");
+                }}
+              >
+                ⬇ CSV (vue courante)
+              </div>
+              <div
+                className="dropitem"
+                onClick={() => {
+                  setShowExport(false);
+                  exportTable("xlsx");
+                }}
+              >
+                ⬇ XLSX (vue courante)
+              </div>
+              <div className="dropsep" />
+              <div
+                className="dropitem"
+                onClick={() => {
+                  setShowExport(false);
+                  setShowReportOpts(true);
+                }}
+              >
+                📄 Rapport (HTML / PDF)…
+              </div>
+            </div>
+          )}
+        </div>
+        <button className="btn" onClick={() => setShowKw(true)}>🔑 Mots-clés</button>
+        <button className="btn" onClick={() => setShowSources(true)} title="Forcer/corriger le navigateur d'un scellé">🗂 Sources</button>
+        <button className="btn" onClick={() => setShowCase(true)}>Dossier…</button>
+        <div className="sep" />
+        <button className="btn" onClick={saveTagsFile} title="Enregistrer les marquages (JSON)">💾 Marquages</button>
+        <button className="btn" onClick={loadTagsFile} title="Charger des marquages (JSON)">📂 Marquages</button>
+        <div className="sep" />
+        <span className="lbl">Thème :</span>
+        <select value={theme} onChange={(e) => setTheme(e.target.value)}>
+          {THEMES.map((t) => (
+            <option key={t} value={t}>{t}</option>
+          ))}
+        </select>
+        <span className="lbl">Fuseau :</span>
+        <select value={tz} onChange={(e) => setTz(e.target.value)}>
+          <option>UTC</option>
+          <option>Local</option>
+        </select>
+        <label className="lbl">
+          <input type="checkbox" checked={noisy} onChange={(e) => setNoisy(e.target.checked)} /> cookies/autofill
+        </label>
+        <div className="grow" />
+        <span className="lbl">Recherche globale :</span>
+        <input
+          value={gsearch}
+          onChange={(e) => setGsearch(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && runSearch()}
+          placeholder="mot-clé…"
+          style={{ width: 200 }}
+        />
+        <button className="btn" onClick={runSearch}>🔎</button>
+        <button className="btn" onClick={() => setShowHelp(true)} title="Aide / emplacements des profils">❓ Aide</button>
+      </div>
+
+      <div className="body">
+        <div className="nav">
+          <div className="navhdr">Navigateurs / sous-catégories</div>
+          {groups.length > 0 && (
+            <>
+              <div
+                className={"node top" + (sel?.kind === "timeline" ? " sel" : "")}
+                onClick={() => setSel({ kind: "timeline" })}
+              >⏱ Timeline unifiée</div>
+              <div
+                className={"node top" + (sel?.kind === "domains" ? " sel" : "")}
+                onClick={() => setSel({ kind: "domains" })}
+              >🌐 Regroupement par domaine</div>
+              <div
+                className={
+                  "node top flag" +
+                  (sel?.kind === "flagged" && sel.browser === null ? " sel" : "")
+                }
+                onClick={() => setSel({ kind: "flagged", browser: null })}
+              >🚩 Liens signalés (tous)</div>
+              <div
+                className={"node top" + (sel?.kind === "search_terms" ? " sel" : "")}
+                onClick={() => setSel({ kind: "search_terms" })}
+              >🔎 Termes recherchés</div>
+              <div
+                className={"node top" + (sel?.kind === "stats" ? " sel" : "")}
+                onClick={() => setSel({ kind: "stats" })}
+              >📊 Statistiques</div>
+              <div
+                className={"node top" + (sel?.kind === "histogram" ? " sel" : "")}
+                onClick={() => setSel({ kind: "histogram" })}
+              >📈 Histogramme d'activité</div>
+              <div
+                className={"node top" + (sel?.kind === "ga" ? " sel" : "")}
+                onClick={() => setSel({ kind: "ga" })}
+              >🍪 Cookies Google Analytics</div>
+              <div
+                className={"node top" + (sel?.kind === "online" ? " sel" : "")}
+                onClick={() => setSel({ kind: "online" })}
+              >🌐 Services en ligne</div>
+              <div
+                className={"node top" + (sel?.kind === "keywords" ? " sel" : "")}
+                onClick={() => setShowKw(true)}
+              >🔑 Recherche par mots-clés</div>
+              <div className="navhdr navsub">Résultats</div>
+              <div
+                className={"node top" + (sel?.kind === "identity" ? " sel" : "")}
+                onClick={() => setSel({ kind: "identity" })}
+              >🪪 Éléments d'identité</div>
+              <div
+                className={"node top" + (sel?.kind === "downloads" ? " sel" : "")}
+                onClick={() => setSel({ kind: "downloads" })}
+              >⬇️ Téléchargements</div>
+              <div
+                className={"node top" + (sel?.kind === "geolocation" ? " sel" : "")}
+                onClick={() => setSel({ kind: "geolocation" })}
+              >📍 Géolocalisations</div>
+              <div
+                className={"node top" + (sel?.kind === "vpn" ? " sel" : "")}
+                onClick={() => setSel({ kind: "vpn" })}
+              >🛡️ VPN / anonymiseurs</div>
+              {media.length > 0 && (
+                <div
+                  className={"node top" + (sel?.kind === "media" ? " sel" : "")}
+                  onClick={() => setSel({ kind: "media" })}
+                >🖼 Galerie média ({media.length})</div>
+              )}
+              {htmls.length > 0 && (
+                <div
+                  className={"node top" + (sel?.kind === "html" ? " sel" : "")}
+                  onClick={() => setSel({ kind: "html" })}
+                >📄 Pages HTML ({htmls.length})</div>
+              )}
+              <div
+                className={"node top flag" + (sel?.kind === "tags" ? " sel" : "")}
+                onClick={() => setSel({ kind: "tags" })}
+              >🏷 Éléments marqués ({tags.length})</div>
+            </>
+          )}
+          {groups.map((g, gi) => {
+            const badge = browserBadge(g.browser);
+            const open = !collapsed.has(g.browser);
+            return (
+            <div key={gi}>
+              <div
+                className="node browser"
+                onClick={() =>
+                  setCollapsed((prev) => {
+                    const n = new Set(prev);
+                    if (n.has(g.browser)) n.delete(g.browser);
+                    else n.add(g.browser);
+                    return n;
+                  })
+                }
+              >
+                <span className="chev">{open ? "▾" : "▸"}</span>
+                <span className="browbadge" style={{ background: badge.bg }}>{badge.ch}</span>
+                {g.browser}
+              </div>
+              {open && g.subs.map((s, si) => (
+                <div key={si}>
+                  <div className="node subhdr">{s.name}</div>
+                  {s.items.map((it, ii) => {
+                    const on =
+                      it.kind === "cat"
+                        ? sel?.kind === "cat" && sel.ai === it.ai && sel.ci === it.ci
+                        : sel?.kind === "flagged" && sel.browser === it.browser;
+                    return (
+                      <div
+                        key={ii}
+                        className={
+                          "node child" +
+                          (it.kind === "flagged" ? " flag" : "") +
+                          (on ? " sel" : "")
+                        }
+                        onClick={() => openItem(it)}
+                      >
+                        {it.label}{" "}
+                        {it.kind === "cat" && (
+                          <span className="count">({it.count})</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          );
+          })}
+          {groups.length === 0 && (
+            <div className="navhdr">Aucune source. Utilisez ➕ Fichiers ou 📁 Dossier.</div>
+          )}
+        </div>
+
+        <div className="right">
+          <div className="filterbar">
+            <span className="lbl">Filtre :</span>
+            <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="filtrer la vue…" />
+            <button className="btn" onClick={() => setFilter("")}>✖</button>
+            <span className="sep" />
+            <span className="lbl">Du :</span>
+            <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+            <span className="lbl">au :</span>
+            <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+            <button
+              className="btn"
+              title="Effacer la plage de dates"
+              onClick={() => {
+                setDateFrom("");
+                setDateTo("");
+              }}
+            >✖ dates</button>
+            <span className="entries">
+              {view ? `${displayed.length} / ${view.rows.length} entrées` : ""}
+            </span>
+          </div>
+
+          <div className="tablewrap" ref={scrollRef}>
+            {sel?.kind === "media" && (
+              <div className="gallery">
+                {media.length === 0 && (
+                  <div className="navhdr">Aucun média. Utilisez « 🖼 Média cache » sur un dossier de cache/profil.</div>
+                )}
+                {media.map((m, i) => (
+                  <div className="mediacard" key={i}>
+                    <div className="mediathumb" onClick={() => setZoomMedia(m)}>
+                      {m.mime.startsWith("image/") ? (
+                        <img src={`data:${m.mime};base64,${m.data}`} loading="lazy" alt={m.name} />
+                      ) : (
+                        <video src={`data:${m.mime};base64,${m.data}`} muted />
+                      )}
+                    </div>
+                    <div className="mediameta">
+                      <span className="medianame" title={m.name}>{m.name}</span>
+                      <span className="mediasub">{m.mime} · {(m.size / 1024).toFixed(0)} Ko</span>
+                      <button className="btn" title="Exporter" onClick={() => saveMediaItem(m)}>💾</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {sel?.kind === "html" && (
+              <div className="htmllist">
+                {htmls.length === 0 && (
+                  <div className="navhdr">Aucune page HTML. Utilisez « 🖼 Cache média/HTML ».</div>
+                )}
+                {htmls.map((h, i) => (
+                  <div className="htmlrow" key={i} onClick={() => setHtmlView(h)}>
+                    <div className="htmltitle">{h.title || "(sans titre)"}</div>
+                    <div className="htmlsub">
+                      {h.name} · {(h.size / 1024).toFixed(0)} Ko · {h.resources.length} ressources
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {view && sel?.kind !== "media" && sel?.kind !== "html" && (
+              <table style={{ width: totalWidth, tableLayout: "fixed" }}>
+                <colgroup>
+                  {view.columns.map((c, i) => (
+                    <col key={c} style={{ width: widths[i] }} />
+                  ))}
+                </colgroup>
+                <thead>
+                  <tr>
+                    {view.columns.map((c, idx) => (
+                      <th
+                        key={c}
+                        onClick={() => toggleSort(c)}
+                        style={{ position: "relative" }}
+                      >
+                        {c}
+                        {sortCol === c ? (sortAsc ? " ▴" : " ▾") : ""}
+                        <span
+                          className="col-resizer"
+                          onMouseDown={(e) => onResizeStart(e, idx)}
+                          onDoubleClick={(e) => onResizeReset(e, idx)}
+                          onClick={(e) => e.stopPropagation()}
+                          title="Glisser pour redimensionner · double-clic pour réinitialiser"
+                          style={{
+                            position: "absolute",
+                            top: 0,
+                            right: 0,
+                            width: 7,
+                            height: "100%",
+                            cursor: "col-resize",
+                            userSelect: "none",
+                          }}
+                        />
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {padTop > 0 && <tr style={{ height: padTop }} />}
+                  {vItems.map((vi) => {
+                    const r = displayed[vi.index];
+                    if (!r) return null; // plage virtualisee transitoirement hors bornes (apres filtrage)
+                    const sig = sigOf(r, view.columns);
+                    const tg = tagBySig.get(sig);
+                    const isSel = selected.has(sig);
+                    return (
+                      <tr
+                        key={vi.index}
+                        className={
+                          (tg ? "tagged" : "") + (isSel ? " selected" : "")
+                        }
+                        title={tg ? `${tg.label}${tg.note ? " — " + tg.note : ""}` : undefined}
+                        onClick={(e) => toggleSelect(e, r)}
+                        onDoubleClick={() => setDetail(r)}
+                        onContextMenu={(e) => openCtx(e, r)}
+                      >
+                        {view.columns.map((c, ci) => (
+                          <td
+                            key={c}
+                            title={fmtCell(r.values[c], tz)}
+                            style={
+                              ci === 0 && tg
+                                ? { boxShadow: `inset 4px 0 0 ${tg.color || "#f59e0b"}` }
+                                : undefined
+                            }
+                          >
+                            {ci === 0 && tg ? (
+                              <span
+                                style={{
+                                  display: "inline-block",
+                                  width: 8,
+                                  height: 8,
+                                  borderRadius: 2,
+                                  background: tg.color || "#f59e0b",
+                                  marginRight: 6,
+                                  verticalAlign: "middle",
+                                }}
+                              />
+                            ) : null}
+                            {fmtCell(r.values[c], tz)}
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  })}
+                  {padBottom > 0 && <tr style={{ height: padBottom }} />}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div className="status">
+            {view ? `${view.title} — SHA-256 : ` : "Prêt."}
+            <span className="mono">{view?.sha ?? ""}</span>
+          </div>
+        </div>
+      </div>
+
+      {detail && view && (
+        <div className="overlay" onClick={() => setDetail(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Détail de l'entrée</h3>
+            {view.columns.map((c) => (
+              <div className="field" key={c}>
+                <div className="k">{c}</div>
+                <div className="v">{fmtCell(detail.values[c], tz)}</div>
+              </div>
+            ))}
+            {detail.raw.length > 0 && (
+              <>
+                <hr />
+                <div className="k">Valeurs brutes (non converties)</div>
+                {detail.raw.map(([k, v], i) => (
+                  <div className="field" key={i}>
+                    <span className="k">{k}</span> = <span className="mono">{v}</span>
+                  </div>
+                ))}
+              </>
+            )}
+            <hr />
+            <div className="k">Source</div>
+            {(() => {
+              const s = sourceForRow(detail);
+              return (
+                <>
+                  <div className="field">
+                    <div className="k">Navigateur</div>
+                    <div className="v">{s.browser || "—"}</div>
+                  </div>
+                  <div className="field">
+                    <div className="k">Chemin complet</div>
+                    <div className="v mono">{s.path || "— (vue agrégée, chemin indisponible)"}</div>
+                  </div>
+                  <div className="field">
+                    <div className="k">Dernière modif.</div>
+                    <div className="v">
+                      {s.modified != null ? fmtCell({ t: "time", v: s.modified }, tz) : "—"}
+                    </div>
+                  </div>
+                  <div className="field">
+                    <div className="k">Taille</div>
+                    <div className="v">
+                      {s.size != null ? `${(s.size / 1024).toFixed(0)} Ko (${s.size} o)` : "—"}
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+            <hr />
+            <div className="k">Marquage d'investigation</div>
+            <div className="tagbox">
+              <div className="tagrow">
+                <select
+                  value={TAG_PRESETS.find((x) => x.name === tagLabel)?.name ?? ""}
+                  onChange={(e) => {
+                    const p = TAG_PRESETS.find((x) => x.name === e.target.value);
+                    if (p) {
+                      setTagLabel(p.name);
+                      setTagColor(p.color);
+                    }
+                  }}
+                >
+                  <option value="">— modèle —</option>
+                  {TAG_PRESETS.map((p) => (
+                    <option key={p.name} value={p.name}>{p.name}</option>
+                  ))}
+                </select>
+                <input
+                  type="color"
+                  value={tagColor}
+                  onChange={(e) => setTagColor(e.target.value)}
+                  title="Couleur de la balise"
+                />
+                <input
+                  type="text"
+                  value={tagLabel}
+                  onChange={(e) => setTagLabel(e.target.value)}
+                  placeholder="Nom de la balise"
+                  style={{ flex: 1 }}
+                />
+              </div>
+              <textarea
+                value={tagNote}
+                onChange={(e) => setTagNote(e.target.value)}
+                placeholder="Annotation (facultatif)…"
+                rows={2}
+              />
+              <div className="tagbtns">
+                <button className="btn" onClick={applyTag}>🏷 Marquer</button>
+                {tagBySig.has(sigOf(detail, view.columns)) && (
+                  <button className="btn" onClick={clearTag}>Retirer le marquage</button>
+                )}
+                <button className="btn" onClick={() => setDetail(null)}>Fermer</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showCase && (
+        <div className="overlay" onClick={() => setShowCase(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Informations du dossier</h3>
+            {([
+              ["Numéro de dossier / PV", "numero"],
+              ["Examinateur", "examinateur"],
+              ["Service", "service"],
+              ["Observations", "notes"],
+            ] as [string, keyof CaseInfo][]).map(([lab, key]) => (
+              <div className="row" key={key}>
+                <label>{lab}</label>
+                <input
+                  value={caseInfo[key]}
+                  onChange={(e) => setCaseInfo({ ...caseInfo, [key]: e.target.value })}
+                />
+              </div>
+            ))}
+            <button className="btn" onClick={() => setShowCase(false)}>Enregistrer</button>
+          </div>
+        </div>
+      )}
+
+      {showHelp && (
+        <div className="overlay" onClick={() => setShowHelp(false)}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+            <h3>NavForensics — Aide</h3>
+            <div className="field">
+              <div className="k">Logiciel</div>
+              <div className="v">NavForensics v{appVersion || "?"}</div>
+            </div>
+            <div className="field">
+              <div className="k">Auteur</div>
+              <div className="v">SCHMITT Franck</div>
+            </div>
+            <div className="field">
+              <div className="k">Principe forensique</div>
+              <div className="v">
+                Lecture seule sur une copie (fichiers -wal/-shm inclus), empreinte SHA-256,
+                horodatages convertis depuis chaque référentiel navigateur, aucun secret déchiffré.
+              </div>
+            </div>
+            <hr />
+            <div className="k">Chargement des artefacts</div>
+            <div className="v">
+              • <b>Auto-détection</b> : charge les profils des navigateurs installés sur <b>cette machine</b> (poste d'analyse) — fermez les navigateurs pour éviter les verrous.<br />
+              • <b>Dossier</b> : analyse récursivement un dossier contenant des profils/artefacts extraits (X-Ways…).<br />
+              • <b>Fichiers</b> : charge une ou plusieurs bases précises.
+            </div>
+            <hr />
+            <div className="k">Emplacements des profils utilisateur</div>
+            <table className="helptab">
+              <thead>
+                <tr><th>Navigateur</th><th>Windows</th><th>Autres OS</th></tr>
+              </thead>
+              <tbody>
+                {HELP_LOCATIONS.map((h) => (
+                  <tr key={h.b}>
+                    <td>{h.b}</td>
+                    <td className="mono">{h.win}</td>
+                    <td>{h.other}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="field">
+              <div className="k">Fichiers clés</div>
+              <div className="v">{HELP_FILES}</div>
+            </div>
+            <button className="btn" onClick={() => setShowHelp(false)}>Fermer</button>
+          </div>
+        </div>
+      )}
+
+      {showSources && (
+        <div className="overlay" onClick={() => setShowSources(false)}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+            <h3>Sources chargées — forcer le navigateur</h3>
+            <div className="note">
+              Corrige le navigateur d'un scellé quand le chemin ne permet pas de le déduire
+              (fichier isolé). Le changement reclasse l'arborescence et s'applique au rapport.
+            </div>
+            {over.length === 0 && <div className="navhdr">Aucune source chargée.</div>}
+            {over.map((o, ai) => (
+              <div className="srcrow" key={ai}>
+                <div className="srcinfo">
+                  <div className="srcname">🗂 {o.evidence} <span className="count">[{o.kind}]</span></div>
+                  <div className="srcpath mono">{o.path || "—"}</div>
+                  <div className="srcmeta mono">
+                    Version : {o.version || "—"} · Installé :{" "}
+                    {o.installed != null
+                      ? fmtCell({ t: "time", v: o.installed }, tz)
+                      : "—"}
+                  </div>
+                </div>
+                <input
+                  list="browserlist"
+                  value={browserDraft[ai] ?? o.browser}
+                  onChange={(e) => setBrowserDraft({ ...browserDraft, [ai]: e.target.value })}
+                />
+                <button className="btn" onClick={() => applyBrowser(ai)}>Appliquer</button>
+              </div>
+            ))}
+            <datalist id="browserlist">
+              {BROWSER_PRESETS.map((b) => (
+                <option key={b} value={b} />
+              ))}
+            </datalist>
+            <button className="btn" onClick={() => setShowSources(false)}>Fermer</button>
+          </div>
+        </div>
+      )}
+
+      {ctxMenu && view && (
+        <div
+          className="ctxoverlay"
+          onClick={() => setCtxMenu(null)}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setCtxMenu(null);
+          }}
+        >
+          <div
+            className="ctxmenu"
+            style={{ left: ctxMenu.x, top: ctxMenu.y }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              className="ctxitem"
+              onClick={() => {
+                const rows = selected.size > 0 ? selectedRows() : [ctxMenu.row];
+                setTagModalRows(rows);
+                setCtxMenu(null);
+              }}
+            >
+              🏷 Marquer{selected.size > 1 ? ` la sélection (${selected.size})` : "…"}
+            </div>
+            {sel?.kind === "identity" && (
+              <div
+                className="ctxitem"
+                onClick={() => {
+                  const rows = selected.size > 0 ? selectedRows() : [ctxMenu.row];
+                  addIdentityToReport(rows);
+                  setCtxMenu(null);
+                }}
+              >
+                ➕ Ajouter au rapport
+                {selected.size > 1 ? ` (${selected.size})` : ""}
+              </div>
+            )}
+            <div
+              className="ctxitem"
+              onClick={() =>
+                untagRows(
+                  selected.size > 0
+                    ? Array.from(selected)
+                    : [sigOf(ctxMenu.row, view.columns)]
+                )
+              }
+            >
+              ✖ Retirer le marquage
+            </div>
+            <div
+              className="ctxitem"
+              onClick={() => copyUrls(selected.size > 0 ? selectedRows() : [ctxMenu.row])}
+            >
+              📋 Copier l'URL{selected.size > 1 ? "s" : ""}
+            </div>
+            <div
+              className="ctxitem"
+              onClick={() => {
+                setDetail(ctxMenu.row);
+                setCtxMenu(null);
+              }}
+            >
+              🔍 Détails
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tagModalRows && (
+        <div className="overlay" onClick={() => setTagModalRows(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Marquer {tagModalRows.length} élément{tagModalRows.length > 1 ? "s" : ""}</h3>
+            <div className="tagbox">
+              <div className="tagrow">
+                <select
+                  value={TAG_PRESETS.find((x) => x.name === tagLabel)?.name ?? ""}
+                  onChange={(e) => {
+                    const p = TAG_PRESETS.find((x) => x.name === e.target.value);
+                    if (p) {
+                      setTagLabel(p.name);
+                      setTagColor(p.color);
+                    }
+                  }}
+                >
+                  <option value="">— modèle —</option>
+                  {TAG_PRESETS.map((p) => (
+                    <option key={p.name} value={p.name}>{p.name}</option>
+                  ))}
+                </select>
+                <input type="color" value={tagColor} onChange={(e) => setTagColor(e.target.value)} />
+                <input
+                  type="text"
+                  value={tagLabel}
+                  onChange={(e) => setTagLabel(e.target.value)}
+                  placeholder="Nom de la balise"
+                  style={{ flex: 1 }}
+                />
+              </div>
+              <textarea
+                value={tagNote}
+                onChange={(e) => setTagNote(e.target.value)}
+                placeholder="Annotation (facultatif)…"
+                rows={2}
+              />
+              <div className="tagbtns">
+                <button className="btn" onClick={() => applyTagToRows(tagModalRows)}>🏷 Appliquer</button>
+                <button className="btn" onClick={() => setTagModalRows(null)}>Annuler</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showReportOpts && (
+        <div className="overlay" onClick={() => setShowReportOpts(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Options du rapport</h3>
+            <label className="optrow">
+              <input
+                type="checkbox"
+                checked={reportOpts.only_tagged}
+                onChange={(e) => setReportOpts({ ...reportOpts, only_tagged: e.target.checked })}
+              />{" "}
+              Uniquement les éléments marqués (+ données du dossier)
+            </label>
+            <hr />
+            <div className="k">Sections à inclure</div>
+            {(
+              [
+                ["include_tags", "Éléments marqués"],
+                ["include_stats", "Statistiques"],
+                ["include_histogram", "Histogramme"],
+                ["include_timeline", "Timeline"],
+                ["include_domains", "Domaines"],
+                ["include_terms", "Termes recherchés"],
+                ["include_online", "Services en ligne"],
+                ["include_ga", "Cookies Google Analytics"],
+                ["include_flagged", "Liens signalés"],
+                ["include_identity", "Éléments d'identité (autofill)"],
+                ["include_downloads", "Téléchargements"],
+                ["include_geolocation", "Géolocalisations"],
+                ["include_vpn", "VPN"],
+                ["include_details", "Détail par navigateur"],
+              ] as [keyof ReportOptions, string][]
+            ).map(([k, lab]) => (
+              <label key={k} className="optrow">
+                <input
+                  type="checkbox"
+                  disabled={reportOpts.only_tagged}
+                  checked={reportOpts[k]}
+                  onChange={(e) => setReportOpts({ ...reportOpts, [k]: e.target.checked })}
+                />{" "}
+                {lab}
+              </label>
+            ))}
+            <hr />
+            <div className="optrow">
+              <span className="k">Éléments d'identité retenus : </span>
+              {identityPick.length === 0 ? (
+                <span className="muted">
+                  aucun (clic droit sur la vue Identité → « Ajouter au rapport »)
+                </span>
+              ) : (
+                <>
+                  <b>{identityPick.length}</b> sélectionné
+                  {identityPick.length > 1 ? "s" : ""}{" "}
+                  <button className="btn small" onClick={() => setIdentityPick([])}>
+                    Vider
+                  </button>
+                </>
+              )}
+            </div>
+            <div className="tagbtns">
+              <button className="btn" onClick={() => exportReport("html")}>
+                📄 Générer HTML
+              </button>
+              <button className="btn" onClick={() => exportReport("pdf")}>
+                📑 Générer PDF
+              </button>
+              <button className="btn" onClick={() => setShowReportOpts(false)}>
+                Fermer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showKw && (
+        <div className="overlay" onClick={() => setShowKw(false)}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+            <h3>Listes de mots-clés forensiques</h3>
+            <div className="kwwrap">
+              <div className="kwlists">
+                {kwLists.map((l, i) => (
+                  <div
+                    key={i}
+                    className={"kwlistitem" + (i === kwSel ? " sel" : "")}
+                    onClick={() => setKwSel(i)}
+                  >
+                    {l.name} <span className="count">({l.words.length})</span>
+                  </div>
+                ))}
+                <div className="tagbtns" style={{ marginTop: 6 }}>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      setKwLists([...kwLists, { name: "Nouvelle liste", words: [] }]);
+                      setKwSel(kwLists.length);
+                    }}
+                  >
+                    ＋ Liste
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => setKwLists(DEFAULT_KW_LISTS)}
+                    title="Réinitialiser aux listes par défaut"
+                  >
+                    ↺ Défaut
+                  </button>
+                </div>
+              </div>
+              <div className="kwedit">
+                {kwLists[kwSel] && (
+                  <>
+                    <input
+                      type="text"
+                      value={kwLists[kwSel].name}
+                      onChange={(e) =>
+                        setKwLists(kwLists.map((l, i) => (i === kwSel ? { ...l, name: e.target.value } : l)))
+                      }
+                      placeholder="Nom de la liste"
+                    />
+                    <textarea
+                      rows={10}
+                      value={kwLists[kwSel].words.join("\n")}
+                      onChange={(e) =>
+                        setKwLists(
+                          kwLists.map((l, i) =>
+                            i === kwSel ? { ...l, words: e.target.value.split("\n") } : l
+                          )
+                        )
+                      }
+                      placeholder="un mot-clé par ligne…"
+                    />
+                    <div className="tagbtns">
+                      <button
+                        className="btn"
+                        onClick={() =>
+                          runKeywordSearch(
+                            kwLists[kwSel].words
+                              .map((w) => w.trim())
+                              .filter(Boolean)
+                              .map((w) => ({ word: w, list: kwLists[kwSel].name }))
+                          )
+                        }
+                      >
+                        🔑 Rechercher cette liste
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={() =>
+                          runKeywordSearch(
+                            kwLists.flatMap((l) =>
+                              l.words.map((w) => w.trim()).filter(Boolean).map((w) => ({ word: w, list: l.name }))
+                            )
+                          )
+                        }
+                      >
+                        🔎 Toutes les listes
+                      </button>
+                      <button
+                        className="btn"
+                        onClick={() => {
+                          const next = kwLists.filter((_, i) => i !== kwSel);
+                          setKwLists(next.length ? next : DEFAULT_KW_LISTS);
+                          setKwSel(0);
+                        }}
+                      >
+                        🗑 Supprimer la liste
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+            <button className="btn" onClick={() => setShowKw(false)}>Fermer</button>
+          </div>
+        </div>
+      )}
+
+      {htmlView && (
+        <div className="overlay" onClick={() => setHtmlView(null)}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+            <h3>
+              {htmlView.title || htmlView.name}{" "}
+              <span className="count">({(htmlView.size / 1024).toFixed(0)} Ko)</span>
+            </h3>
+            <div className="note">
+              Code source brut, affiché en lecture seule : aucun script n'est exécuté et la page n'est pas rendue.
+            </div>
+            <div className="k">Ressources liées ({htmlView.resources.length})</div>
+            <div className="htmlres">
+              <table className="helptab">
+                <thead>
+                  <tr><th>Type</th><th>URL</th></tr>
+                </thead>
+                <tbody>
+                  {htmlView.resources.map((r, i) => (
+                    <tr key={i}>
+                      <td>{r.kind}</td>
+                      <td className="mono">{r.url}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="k">Code source</div>
+            <pre className="htmlsrc">{htmlView.source}</pre>
+            <button className="btn" onClick={() => setHtmlView(null)}>Fermer</button>
+          </div>
+        </div>
+      )}
+
+      {zoomMedia && (
+        <div className="overlay" onClick={() => setZoomMedia(null)}>
+          <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+            <h3>
+              {zoomMedia.name} <span className="count">({zoomMedia.mime})</span>
+            </h3>
+            <div className="zoomwrap">
+              {zoomMedia.mime.startsWith("image/") ? (
+                <img src={`data:${zoomMedia.mime};base64,${zoomMedia.data}`} alt={zoomMedia.name} />
+              ) : (
+                <video src={`data:${zoomMedia.mime};base64,${zoomMedia.data}`} controls />
+              )}
+            </div>
+            <div className="tagbtns">
+              <button className="btn" onClick={() => saveMediaItem(zoomMedia)}>💾 Exporter</button>
+              <button className="btn" onClick={() => setZoomMedia(null)}>Fermer</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
