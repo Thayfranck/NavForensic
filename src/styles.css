@@ -96,14 +96,20 @@ select, input {
 .entries { font-size: 12px; color: var(--muted); white-space: nowrap; }
 
 .tablewrap { flex: 1; overflow: auto; margin: 0 2px; position: relative; }
-table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+/* border-collapse: separate + hauteur de ligne FIXE (24px exacts) : la hauteur
+   réelle de chaque ligne correspond pile à estimateSize(24) du virtualiseur,
+   sinon l'écart s'accumule et l'ascenseur ne suit plus le contenu. */
+table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12.5px; }
 thead th {
-  position: sticky; top: 0; background: var(--head); color: var(--headfg);
-  text-align: left; padding: 6px 9px; font-weight: 600; cursor: pointer;
-  white-space: nowrap; border-right: 1px solid rgba(0,0,0,.3);
+  position: sticky; top: 0; z-index: 1; background: var(--head); color: var(--headfg);
+  text-align: left; padding: 6px 9px; font-weight: 600; cursor: pointer; height: 30px;
+  box-sizing: border-box; white-space: nowrap; border-right: 1px solid rgba(0,0,0,.3);
+  border-bottom: 1px solid rgba(0,0,0,.35);
 }
+tbody tr { height: 24px; }
 tbody td {
-  padding: 4px 9px; border-bottom: 1px solid rgba(255,255,255,.05);
+  height: 24px; padding: 0 9px; line-height: 23px; box-sizing: border-box;
+  border-bottom: 1px solid rgba(255,255,255,.05);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 tbody tr:nth-child(even) td { background: var(--even); }
@@ -263,3 +269,17 @@ tbody tr.selected td { background: rgba(56,189,248,.22); }
 .tlticks { position: relative; height: 16px; margin: 0 8px; }
 .tltick { position: absolute; transform: translateX(-50%); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
 .tlhint { font-size: 10.5px; color: var(--muted); padding: 2px 8px 6px; text-align: center; }
+/* frise : barres (zoom précis), curseur de survol, infobulle */
+.tlsvgwrap { position: relative; }
+.tlbarrect { opacity: .9; }
+.tlcursor { stroke: var(--accent); stroke-width: 1; opacity: .8; vector-effect: non-scaling-stroke; pointer-events: none; }
+.tltip {
+  position: absolute; top: 4px; transform: translateX(-50%);
+  background: var(--panel); border: 1px solid var(--border); border-radius: 5px;
+  padding: 4px 7px; font-size: 10.5px; color: var(--fg); pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,.35); white-space: nowrap; z-index: 5; max-width: 220px;
+}
+.tltipd { font-weight: 600; margin-bottom: 1px; }
+.tltipn { color: var(--muted); }
+.tltipr { display: flex; align-items: center; gap: 5px; color: var(--muted); }
+.tltipr i { width: 9px; height: 3px; border-radius: 2px; display: inline-block; flex: none; }

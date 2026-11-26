@@ -28,6 +28,8 @@ struct TagEntry {
     modified: Option<i64>, // date de modif du fichier source (ms Unix)
     #[serde(default)]
     size: Option<i64>, // taille du fichier source (octets)
+    #[serde(default)]
+    origin: String,  // d'où vient le marquage : "kw" (mots-clés), "search" (recherche globale), "" (autre)
 }
 
 /// Pile du thread de travail : 64 Mo (le thread principal Windows n'a que 1 Mo,
@@ -40,8 +42,13 @@ struct AppState {
     // Accumulateur de tous les résultats de recherche par mots-clés de la
     // session (conservés d'une recherche à l'autre), pour la vue Résultats.
     kw_results: Mutex<Vec<nf::model::Row>>,
+    // Tous les termes recherchés dans la session (mot, liste), même sans
+    // correspondance : la vue Résultats affiche ainsi « aucun résultat » pour eux.
+    kw_terms: Mutex<Vec<(String, String)>>,
     // Correspondances de la dernière liste de surveillance (IOC) chargée.
     ioc_results: Mutex<Vec<nf::model::Row>>,
+    // Derniers identifiants Firefox déchiffrés (pour la vue Résultats + export).
+    fx_results: Mutex<Vec<nf::model::Row>>,
 }
 
 type Arts = Mutex<Vec<Artifact>>;
@@ -56,6 +63,10 @@ fn lock_tags(m: &Mutex<Vec<TagEntry>>) -> MutexGuard<'_, Vec<TagEntry>> {
 }
 
 fn lock_kw(m: &Mutex<Vec<nf::model::Row>>) -> MutexGuard<'_, Vec<nf::model::Row>> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn lock_terms(m: &Mutex<Vec<(String, String)>>) -> MutexGuard<'_, Vec<(String, String)>> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -278,11 +289,15 @@ fn add_cache(state: tauri::State<AppState>, folder: String) -> Result<LoadSummar
 fn clear(state: tauri::State<AppState>) -> Result<(), String> {
     let arts = &state.arts;
     let kwres = &state.kw_results;
+    let kwterms = &state.kw_terms;
     let iocres = &state.ioc_results;
+    let fxres = &state.fx_results;
     run(move || {
         lock(arts).clear();
         lock_kw(kwres).clear();
+        lock_terms(kwterms).clear();
         lock_kw(iocres).clear();
+        lock_kw(fxres).clear();
     })
 }
 
@@ -604,9 +619,19 @@ fn kw_sig(r: &nf::model::Row) -> String {
 fn keyword_search(state: tauri::State<AppState>, keywords: Vec<KwItem>) -> Result<ViewData, String> {
     let arts = &state.arts;
     let kwres = &state.kw_results;
+    let kwterms = &state.kw_terms;
     run(move || {
         let pairs: Vec<(String, String)> =
             keywords.into_iter().map(|k| (k.word, k.list)).collect();
+        // Mémorise chaque terme recherché (sans doublon), même sans résultat.
+        {
+            let mut terms = lock_terms(kwterms);
+            for (w, l) in &pairs {
+                if !w.trim().is_empty() && !terms.iter().any(|(tw, tl)| tw == w && tl == l) {
+                    terms.push((w.clone(), l.clone()));
+                }
+            }
+        }
         let a = lock(arts);
         let rows = nf::search_keywords(&a, &pairs);
         // Accumule dans la session (sans doublon) pour la vue Résultats.
@@ -624,13 +649,51 @@ fn keyword_search(state: tauri::State<AppState>, keywords: Vec<KwItem>) -> Resul
     })
 }
 
-/// Vue Résultats : tous les résultats de recherche par mots-clés accumulés.
+/// Construit les lignes de la vue Résultats : toutes les correspondances
+/// accumulées, puis une ligne « (aucun résultat) » pour chaque terme recherché
+/// qui n'a produit aucune correspondance — ainsi tous les mots-clés recherchés
+/// et leur résultat sont visibles.
+fn build_kw_view_rows(
+    hits: &[nf::model::Row],
+    terms: &[(String, String)],
+) -> Vec<nf::model::Row> {
+    use nf::model::Cell;
+    let mut rows: Vec<nf::model::Row> = hits.to_vec();
+    let matched: std::collections::HashSet<String> = hits
+        .iter()
+        .map(|r| {
+            r.get("Mot-cle")
+                .map(|x| x.as_search().to_lowercase())
+                .unwrap_or_default()
+        })
+        .collect();
+    for (w, l) in terms {
+        if !matched.contains(&w.to_lowercase()) {
+            let mut rr = nf::model::Row::new();
+            rr.set("Mot-cle", Cell::text(w.clone()));
+            rr.set("Liste", Cell::text(l.clone()));
+            rr.set("Navigateur", Cell::text(String::new()));
+            rr.set("Categorie", Cell::text(String::new()));
+            rr.set("Colonne", Cell::text(String::new()));
+            rr.set("Valeur", Cell::text("(aucun résultat)".to_string()));
+            rows.push(rr);
+        }
+    }
+    rows
+}
+
+/// Vue Résultats : correspondances accumulées + termes sans résultat.
 #[tauri::command]
 fn kw_results_view(state: tauri::State<AppState>) -> Result<ViewData, String> {
     let kwres = &state.kw_results;
-    run(move || ViewData {
-        columns: cols_vec(nf::SEARCH_KW_COLUMNS),
-        rows: lock_kw(kwres).clone(),
+    let kwterms = &state.kw_terms;
+    run(move || {
+        let hits = lock_kw(kwres).clone();
+        let terms = lock_terms(kwterms).clone();
+        ViewData {
+            columns: cols_vec(nf::SEARCH_KW_COLUMNS),
+            rows: build_kw_view_rows(&hits, &terms),
+        }
     })
 }
 
@@ -658,6 +721,107 @@ fn ioc_results_view(state: tauri::State<AppState>) -> Result<ViewData, String> {
         columns: cols_vec(nf::IOC_COLUMNS),
         rows: lock_kw(iocres).clone(),
     })
+}
+
+/// Nombre d'éléments de chaque entrée de la colonne Résultats, affiché entre
+/// parenthèses dans le panneau de gauche. Calculé en un seul appel.
+#[tauri::command]
+fn results_counts(
+    state: tauri::State<AppState>,
+) -> Result<std::collections::BTreeMap<String, usize>, String> {
+    let arts = &state.arts;
+    let iocres = &state.ioc_results;
+    let fxres = &state.fx_results;
+    run(move || {
+        let a = lock(arts);
+        let mut m: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        m.insert("identity".to_string(), nf::build_identity(&a).len());
+        m.insert("downloads".to_string(), nf::build_downloads(&a).len());
+        m.insert("geolocation".to_string(), nf::build_geolocation(&a).len());
+        m.insert("vpn".to_string(), nf::build_vpn(&a).len());
+        m.insert("recovered".to_string(), nf::build_recovered(&a).len());
+        m.insert("crypto".to_string(), nf::build_crypto(&a).len());
+        m.insert("sync".to_string(), nf::build_sync_accounts(&a).len());
+        m.insert("extensions".to_string(), nf::build_extensions(&a).len());
+        m.insert("geopoints".to_string(), nf::build_geopoints(&a).len());
+        // Pattern of life : nombre total d'évènements horaires (somme des cases).
+        let heat = nf::build_heatmap(&a, "UTC");
+        let mut ev = 0usize;
+        for r in &heat {
+            for c in nf::HEATMAP_COLUMNS.iter().skip(1) {
+                ev += r.get(c).and_then(|x| x.int_val()).unwrap_or(0).max(0) as usize;
+            }
+        }
+        m.insert("heatmap".to_string(), ev);
+        m.insert("ioc".to_string(), lock_kw(iocres).len());
+        m.insert("fxpasswords".to_string(), lock_kw(fxres).len());
+        m
+    })
+}
+
+/// Colonnes de la vue « Mots de passe Firefox ».
+const FX_COLUMNS: &[&str] = &["Navigateur", "URL", "Identifiant", "Mot de passe", "Source (chemin)"];
+
+/// Déchiffre les identifiants Firefox d'un dossier de profil explicite, ou à
+/// défaut des profils des sources Firefox déjà chargées. `master_password` peut
+/// être vide. Lecture seule sur copie.
+#[tauri::command]
+fn firefox_passwords(
+    state: tauri::State<AppState>,
+    master_password: String,
+    dir: Option<String>,
+) -> Result<ViewData, String> {
+    let arts = &state.arts;
+    let fxres = &state.fx_results;
+    run(move || -> Result<ViewData, String> {
+        use nf::model::Cell;
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(d) = dir {
+            dirs.push(std::path::PathBuf::from(d));
+        } else {
+            let a = lock(arts);
+            for art in a.iter() {
+                if art.browser.to_lowercase().contains("firefox") {
+                    if let Some(p) = std::path::Path::new(&art.path).parent() {
+                        let pb = p.to_path_buf();
+                        if !dirs.contains(&pb) {
+                            dirs.push(pb);
+                        }
+                    }
+                }
+            }
+        }
+        if dirs.is_empty() {
+            return Err("Aucun profil Firefox chargé. Chargez une source Firefox, ou indiquez un dossier de profil contenant key4.db et logins.json.".into());
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for d in &dirs {
+            if !d.join("key4.db").exists() {
+                continue; // profil sans base de clés : ignoré sans erreur
+            }
+            match nf::decrypt_profile(d, &master_password) {
+                Ok(creds) => {
+                    for c in creds {
+                        let mut r = Row::new();
+                        r.set("Navigateur", Cell::text("Firefox".to_string()));
+                        r.set("URL", Cell::text(c.url));
+                        r.set("Identifiant", Cell::text(c.username));
+                        r.set("Mot de passe", Cell::text(c.password));
+                        r.set("Source (chemin)", Cell::text(d.display().to_string()));
+                        r.set("_chemin", Cell::text(d.display().to_string()));
+                        rows.push(r);
+                    }
+                }
+                Err(e) => errors.push(format!("{} : {e}", d.display())),
+            }
+        }
+        if rows.is_empty() && !errors.is_empty() {
+            return Err(errors.join(" ; "));
+        }
+        *lock_kw(fxres) = rows.clone();
+        Ok(ViewData { columns: cols_vec(FX_COLUMNS), rows })
+    })?
 }
 
 #[tauri::command]
@@ -944,7 +1108,9 @@ fn export_view(
 ) -> Result<(), String> {
     let arts = &state.arts;
     let kwres = &state.kw_results;
+    let kwterms = &state.kw_terms;
     let iocres = &state.ioc_results;
+    let fxres = &state.fx_results;
     run(move || -> Result<(), String> {
         let a = lock(arts);
         let (columns, rows, sheet) = match view.as_str() {
@@ -999,8 +1165,17 @@ fn export_view(
             "vpn" => (cols_vec(nf::VPN_COLUMNS), nf::build_vpn(&a), "VPN"),
             "recovered" => (cols_vec(nf::RECOVERED_COLUMNS), nf::build_recovered(&a), "Recuperes"),
             "crypto" => (cols_vec(nf::CRYPTO_COLUMNS), nf::build_crypto(&a), "Crypto-actifs"),
-            "kwresults" => (cols_vec(nf::SEARCH_KW_COLUMNS), lock_kw(kwres).clone(), "Recherches mots-cles"),
+            "kwresults" => {
+                let hits = lock_kw(kwres).clone();
+                let terms = lock_terms(kwterms).clone();
+                (
+                    cols_vec(nf::SEARCH_KW_COLUMNS),
+                    build_kw_view_rows(&hits, &terms),
+                    "Recherches mots-cles",
+                )
+            }
             "ioc" => (cols_vec(nf::IOC_COLUMNS), lock_kw(iocres).clone(), "Correspondances IOC"),
+            "fxpasswords" => (cols_vec(FX_COLUMNS), lock_kw(fxres).clone(), "Mots de passe Firefox"),
             "sync" => (cols_vec(nf::SYNC_COLUMNS), nf::build_sync_accounts(&a), "Comptes sync"),
             "extensions" => (cols_vec(nf::EXT_COLUMNS), nf::build_extensions(&a), "Extensions"),
             "geopoints" => (cols_vec(nf::GEOPOINT_COLUMNS), nf::build_geopoints(&a), "Points geolocalises"),
@@ -1155,7 +1330,9 @@ fn main() {
             arts: Mutex::new(Vec::new()),
             tags: Mutex::new(Vec::new()),
             kw_results: Mutex::new(Vec::new()),
+            kw_terms: Mutex::new(Vec::new()),
             ioc_results: Mutex::new(Vec::new()),
+            fx_results: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             add_paths,
@@ -1185,6 +1362,8 @@ fn main() {
             kw_results_view,
             ioc_load,
             ioc_results_view,
+            firefox_passwords,
+            results_counts,
             sync_accounts,
             extensions,
             geopoints,

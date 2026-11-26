@@ -246,14 +246,19 @@ const FIREFOX_FILES: &[&str] = &[
     "signedInUser.json",
     "extensions.json",
 ];
-/// (dossier éditeur, produit) sous AppData/Local pour les navigateurs Chromium.
+/// (dossier éditeur, produit) sous AppData/Local pour les navigateurs Chromium
+/// qui suivent le schéma `.../User Data/<profil>/`.
 const CHROMIUM_VENDORS: &[(&str, &str)] = &[
     ("Google", "Chrome"),
     ("Microsoft", "Edge"),
     ("BraveSoftware", "Brave-Browser"),
     ("Chromium", "Chromium"),
     ("Vivaldi", "Vivaldi"),
+    ("Yandex", "YandexBrowser"),
 ];
+/// Variantes d'Opera : profil directement sous Roaming/Opera Software/<variante>
+/// (pas de niveau « User Data/<profil> »).
+const OPERA_VARIANTS: &[&str] = &["Opera Stable", "Opera GX Stable", "Opera Next", "Opera Developer"];
 
 fn grab_with_sidecars(fs: &NtfsFs<OffsetReaderAny>, src: &str, dest: &Path) -> bool {
     let ok = grab(fs, src, dest);
@@ -313,6 +318,24 @@ fn extract_volume(fs: &NtfsFs<OffsetReaderAny>, out: &Path, extracted: &mut Vec<
         let dest = out.join(&user).join("IE_Edge").join("WebCacheV01.dat");
         if grab(fs, &src, &dest) {
             extracted.push(dest);
+        }
+
+        // Opera (Chromium) : profil directement sous Roaming/Opera Software/<variante>.
+        for variant in OPERA_VARIANTS {
+            let base = format!("{ra}/Opera Software/{variant}");
+            let vdir = variant.replace(' ', "_");
+            for f in CHROMIUM_FILES {
+                let src = format!("{base}/{f}");
+                let dest = out.join(&user).join(&vdir).join(f);
+                if grab_with_sidecars(fs, &src, &dest) {
+                    extracted.push(dest);
+                }
+            }
+            let src = format!("{base}/Network/Cookies");
+            let dest = out.join(&user).join(&vdir).join("Cookies-Network");
+            if grab(fs, &src, &dest) {
+                extracted.push(dest);
+            }
         }
 
         // Firefox.

@@ -9,6 +9,7 @@ pub mod model;
 pub mod carve;
 pub mod crypto;
 pub mod e01;
+pub mod firefox_login;
 pub mod ioc;
 pub mod parsers;
 pub mod profiles;
@@ -25,6 +26,7 @@ pub use taxonomy::{
     build_flagged, classify_url, sub_category, FLAGGED_COLUMNS, FLAGGED_SUB, SUBCATEGORY_ORDER,
 };
 pub use crypto::{build_crypto, CRYPTO_COLUMNS};
+pub use firefox_login::{decrypt_profile, FxLogin};
 pub use ioc::{build_ioc_matches, parse_iocs, Ioc, IOC_COLUMNS};
 pub use profiles::{build_extensions, build_sync_accounts, EXT_COLUMNS, SYNC_COLUMNS};
 pub use views::{
@@ -236,27 +238,46 @@ pub fn detect(path: &Path) -> Option<&'static str> {
 
 const CHROMIUM: &str = "Chromium (Chrome/Edge/Brave/Opera/Vivaldi)";
 
-/// Précise le vrai navigateur Chromium d'après le chemin (dossier éditeur).
+/// Signatures de chemin (desktop + conteneurs/paquets mobiles) → navigateur.
+/// Reconnaît les éditeurs Chromium au-delà des cinq de bureau : Samsung
+/// Internet, UC Browser, Arc, Yandex, Opera GX, ainsi que les paquets Android
+/// (`com.*`) et les conteneurs iOS. Les signatures les plus spécifiques
+/// passent avant les plus génériques.
+const BROWSER_PATH_SIGS: &[(&[&str], &str)] = &[
+    // Google Chrome (desktop, Android com.android.chrome, iOS com.google.chrome.ios)
+    (&["/google/chrome", "com.android.chrome", "com.google.chrome", "chrome.ios"], "Google Chrome"),
+    // Microsoft Edge (desktop ; Android com.microsoft.emmx ; iOS com.microsoft.msedge)
+    (&["/microsoft/edge", "com.microsoft.emmx", "com.microsoft.msedge"], "Microsoft Edge"),
+    // Brave (desktop ; Android com.brave.browser ; iOS com.brave.ios.browser)
+    (&["/bravesoftware", "/brave-browser", "com.brave"], "Brave"),
+    // Opera GX (avant Opera générique)
+    (&["/opera gx", "com.opera.gx"], "Opera GX"),
+    // Opera (desktop ; Android com.opera.browser ; Opera Mini com.opera.mini.native)
+    (&["/opera software", "/opera stable", "com.opera.browser", "com.opera.mini", "/com.opera"], "Opera"),
+    // Vivaldi (desktop ; Android com.vivaldi.browser)
+    (&["/vivaldi", "com.vivaldi"], "Vivaldi"),
+    // Samsung Internet (Android com.sec.android.app.sbrowser)
+    (&["com.sec.android.app.sbrowser", "/sbrowser", "samsung internet"], "Samsung Internet"),
+    // UC Browser (Android com.ucmobile / com.uc.browser)
+    (&["com.ucmobile", "com.uc.browser", "ucbrowser", "/ucmobile"], "UC Browser"),
+    // Yandex (desktop /yandex ; Android com.yandex.browser)
+    (&["yandexbrowser", "com.yandex.browser", "/yandex"], "Yandex"),
+    // Arc (The Browser Company ; desktop + iOS company.thebrowser.*)
+    (&["/thebrowsercompany", "company.thebrowser", "/arc/user data", "/arc.app"], "Arc"),
+    // Chromium générique (en dernier)
+    (&["/chromium", "org.chromium"], "Chromium"),
+];
+
+/// Précise le vrai navigateur d'après le chemin (dossier éditeur desktop ou
+/// paquet/conteneur mobile). S'applique quand la détection par contenu a rendu
+/// l'étiquette Chromium générique.
 fn refine_browser(browser: &str, path: &str) -> String {
     if browser == CHROMIUM {
         let p = path.to_ascii_lowercase().replace('\\', "/");
-        if p.contains("/google/chrome") {
-            return "Google Chrome".into();
-        }
-        if p.contains("/microsoft/edge") {
-            return "Microsoft Edge".into();
-        }
-        if p.contains("/bravesoftware") || p.contains("/brave-browser") {
-            return "Brave".into();
-        }
-        if p.contains("/opera software") || p.contains("/opera stable") || p.contains("/opera gx") {
-            return "Opera".into();
-        }
-        if p.contains("/vivaldi") {
-            return "Vivaldi".into();
-        }
-        if p.contains("/chromium") {
-            return "Chromium".into();
+        for (sigs, name) in BROWSER_PATH_SIGS {
+            if sigs.iter().any(|s| p.contains(s)) {
+                return (*name).to_string();
+            }
         }
     }
     browser.to_string()
@@ -400,6 +421,14 @@ mod browser_tests {
         assert_eq!(refine_browser(CHROMIUM, "C:\\Users\\x\\AppData\\Local\\Microsoft\\Edge\\User Data\\Default\\History"), "Microsoft Edge");
         assert_eq!(refine_browser(CHROMIUM, "/x/BraveSoftware/Brave-Browser/User Data/Default/History"), "Brave");
         assert_eq!(refine_browser(CHROMIUM, "D:/dump/Vivaldi/User Data/Default/History"), "Vivaldi");
+        // mobiles + éditeurs supplémentaires reconnus par signature de chemin
+        assert_eq!(refine_browser(CHROMIUM, "/ffs/data/data/com.sec.android.app.sbrowser/app_sbrowser/Default/History"), "Samsung Internet");
+        assert_eq!(refine_browser(CHROMIUM, "/ffs/data/data/com.android.chrome/app_chrome/Default/History"), "Google Chrome");
+        assert_eq!(refine_browser(CHROMIUM, "/ffs/data/data/com.microsoft.emmx/app_chrome/Default/History"), "Microsoft Edge");
+        assert_eq!(refine_browser(CHROMIUM, "/ffs/data/data/com.UCMobile.intl/History".to_ascii_lowercase().as_str()), "UC Browser");
+        assert_eq!(refine_browser(CHROMIUM, "/Containers/Data/Application/ABC/Library/Application Support/company.thebrowser.arc/History"), "Arc");
+        assert_eq!(refine_browser(CHROMIUM, "C:/Users/x/AppData/Local/Yandex/YandexBrowser/User Data/Default/History"), "Yandex");
+        assert_eq!(refine_browser(CHROMIUM, "%APPDATA%/Opera Software/Opera GX Stable/History"), "Opera GX");
         assert_eq!(refine_browser(CHROMIUM, "E:/extraction/History"), CHROMIUM); // inconnu -> generique
         assert_eq!(refine_browser("Firefox", "/x/places.sqlite"), "Firefox");
     }

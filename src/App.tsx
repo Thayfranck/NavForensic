@@ -163,10 +163,16 @@ function TimelineBrush({
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const dragRef = useRef<{ t0: number; moved: boolean } | null>(null);
+  const panRef = useRef<{ x: number; win: [number, number] } | null>(null);
+  const [grab, setGrab] = useState(false);
+  const [hover, setHover] = useState<{ frac: number; t: number; i: number } | null>(null);
   const N = 120;
   const [winMin, winMax] = win;
   const span = Math.max(1, winMax - winMin);
   const useUTC = tz === "UTC";
+  // Au-delà d'un certain niveau de zoom (fenêtre ≤ 3 jours), on passe des
+  // courbes lissées à des barres verticales, plus précises tranche par tranche.
+  const barMode = span <= 3 * 86400000;
 
   // Types les plus fréquents (max 7 séries), + comptes par tranche.
   const { series, total, maxY } = useMemo(() => {
@@ -199,8 +205,8 @@ function TimelineBrush({
     const d = new Date(ms);
     const p = (n: number) => String(n).padStart(2, "0");
     return useUTC
-      ? `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}Z`
-      : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+      ? `${p(d.getUTCDate())}-${p(d.getUTCMonth() + 1)}-${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}Z`
+      : `${p(d.getDate())}-${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
   };
   const xCenter = (i: number) => (i + 0.5) * (1000 / N);
   const yOf = (c: number) => 90 - (c / maxY) * 82;
@@ -216,19 +222,50 @@ function TimelineBrush({
   const timeAt = (clientX: number) => winMin + fracFromClientX(clientX) * span;
   const xOf = (t: number) => ((t - winMin) / span) * 1000;
 
+  const updateHover = (clientX: number) => {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    let i = Math.floor(frac * N);
+    if (i >= N) i = N - 1;
+    if (i < 0) i = 0;
+    setHover({ frac, t: winMin + frac * span, i });
+  };
   const onDown = (e: React.PointerEvent) => {
     (e.target as Element).setPointerCapture?.(e.pointerId);
+    // clic droit (ou molette) = déplacement de la fenêtre (curseur main)
+    if (e.button === 2 || e.button === 1) {
+      panRef.current = { x: e.clientX, win: [winMin, winMax] };
+      setGrab(true);
+      return;
+    }
     dragRef.current = { t0: timeAt(e.clientX), moved: false };
   };
   const onMove = (e: React.PointerEvent) => {
-    if (!dragRef.current) return;
-    const t1 = timeAt(e.clientX);
-    dragRef.current.moved = true;
-    onSel([Math.min(dragRef.current.t0, t1), Math.max(dragRef.current.t0, t1)]);
+    if (panRef.current) {
+      const rect = svgRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const dt = -((e.clientX - panRef.current.x) / rect.width) * span;
+      let a = panRef.current.win[0] + dt;
+      let b = panRef.current.win[1] + dt;
+      if (a < extent[0]) { a = extent[0]; b = a + span; }
+      if (b > extent[1]) { b = extent[1]; a = b - span; }
+      onWin([a, b]);
+      return;
+    }
+    if (dragRef.current) {
+      const t1 = timeAt(e.clientX);
+      dragRef.current.moved = true;
+      onSel([Math.min(dragRef.current.t0, t1), Math.max(dragRef.current.t0, t1)]);
+      return;
+    }
+    updateHover(e.clientX);
   };
   const onUp = () => {
     if (dragRef.current && !dragRef.current.moved) onSel(null);
     dragRef.current = null;
+    panRef.current = null;
+    setGrab(false);
   };
 
   useEffect(() => {
@@ -254,6 +291,39 @@ function TimelineBrush({
   const selX1 = sel ? xOf(Math.max(sel[0], winMin)) : 0;
   const selX2 = sel ? xOf(Math.min(sel[1], winMax)) : 0;
 
+  // barres empilées par série (mode zoom précis)
+  const barW = (1000 / N) * 0.82;
+  const bars: React.ReactNode[] = [];
+  if (barMode) {
+    for (let i = 0; i < N; i++) {
+      const tt = total[i];
+      if (!tt) continue;
+      let acc = 0;
+      const x = xCenter(i) - barW / 2;
+      for (let si = 0; si < series.length; si++) {
+        const c = series[si].counts[i];
+        if (!c) continue;
+        const yTop = yOf(acc + c);
+        const h = Math.max(0.6, yOf(acc) - yTop);
+        bars.push(
+          <rect key={`${i}-${si}`} x={x.toFixed(1)} y={yTop.toFixed(1)} width={barW.toFixed(1)} height={h.toFixed(1)} className="tlbarrect" style={{ fill: TL_PALETTE[si % TL_PALETTE.length] }} />
+        );
+        acc += c;
+      }
+    }
+  }
+
+  // infobulle au survol
+  const hoverInfo = hover
+    ? {
+        t: hover.t,
+        tot: total[hover.i] || 0,
+        parts: series
+          .map((s, si) => ({ type: s.type, c: s.counts[hover.i] || 0, color: TL_PALETTE[si % TL_PALETTE.length] }))
+          .filter((p) => p.c > 0),
+      }
+    : null;
+
   return (
     <div className="tlbrush">
       <div className="tlbar">
@@ -273,14 +343,18 @@ function TimelineBrush({
           ))}
         </span>
       </div>
+      <div className="tlsvgwrap">
       <svg
         ref={svgRef}
         className="tlsvg"
         viewBox="0 0 1000 100"
         preserveAspectRatio="none"
+        style={{ cursor: grab ? "grabbing" : "crosshair" }}
         onPointerDown={onDown}
         onPointerMove={onMove}
         onPointerUp={onUp}
+        onPointerLeave={() => setHover(null)}
+        onContextMenu={(e) => e.preventDefault()}
         onDoubleClick={(e) => {
           const center = timeAt(e.clientX);
           const ns = Math.max(60000, span / 4);
@@ -295,18 +369,39 @@ function TimelineBrush({
           return <line key={i} x1={x} y1={0} x2={x} y2={90} className="tlgrid" />;
         })}
         {sel && selX2 > selX1 && <rect x={selX1} y={0} width={selX2 - selX1} height={90} className="tlselrect" />}
-        <path d={areaPath(total)} className="tlarea" />
-        {series.map((s, i) => (
-          <path key={i} d={path(s.counts)} className="tlline" style={{ stroke: TL_PALETTE[i % TL_PALETTE.length] }} />
-        ))}
+        {barMode ? (
+          bars
+        ) : (
+          <>
+            <path d={areaPath(total)} className="tlarea" />
+            {series.map((s, i) => (
+              <path key={i} d={path(s.counts)} className="tlline" style={{ stroke: TL_PALETTE[i % TL_PALETTE.length] }} />
+            ))}
+          </>
+        )}
+        {hover && <line x1={(hover.frac * 1000).toFixed(1)} y1={0} x2={(hover.frac * 1000).toFixed(1)} y2={90} className="tlcursor" />}
         <line x1={0} y1={90} x2={1000} y2={90} className="tlaxis" />
       </svg>
+      {hoverInfo && (
+        <div
+          className="tltip"
+          style={{ left: `${(hover!.frac * 100).toFixed(1)}%` }}
+        >
+          <div className="tltipd">{fmt(hoverInfo.t)}</div>
+          <div className="tltipn"><b>{hoverInfo.tot}</b> consultation{hoverInfo.tot > 1 ? "s" : ""}</div>
+          {hoverInfo.parts.length > 1 &&
+            hoverInfo.parts.slice(0, 6).map((p, k) => (
+              <div key={k} className="tltipr"><i style={{ background: p.color }} />{p.type} : {p.c}</div>
+            ))}
+        </div>
+      )}
+      </div>
       <div className="tlticks">
         {ticks.map((tk, i) => (
           <span key={i} className="tltick" style={{ left: (xOf(tk.t) / 10).toFixed(2) + "%" }}>{tk.label}</span>
         ))}
       </div>
-      <div className="tlhint">glisser = sélectionner · molette = zoomer · double-clic = affiner · {events.length} évènements</div>
+      <div className="tlhint">glisser = sélectionner · clic droit = déplacer · molette = zoomer · double-clic = affiner{barMode ? " · mode barres (zoom précis)" : ""} · {events.length} évènements</div>
     </div>
   );
 }
@@ -323,13 +418,14 @@ type Selection =
   | { kind: "histogram" }
   | { kind: "online" }
   | { kind: "keywords" }
-  | { kind: "identity" }
+  | { kind: "identity"; group?: string; type?: string }
   | { kind: "downloads" }
   | { kind: "geolocation" }
   | { kind: "vpn" }
   | { kind: "recovered" }
   | { kind: "crypto" }
   | { kind: "kwresults" }
+  | { kind: "fxpasswords" }
   | { kind: "ioc" }
   | { kind: "sync" }
   | { kind: "extensions" }
@@ -418,6 +514,9 @@ const TAG_PRESETS: { name: string; color: string }[] = [
   { name: "À vérifier", color: "#3b82f6" },
 ];
 
+// --- Référentiel desktop (Windows Vista→11, macOS, Linux). Pour Windows XP,
+//     remplacer %LOCALAPPDATA% par %USERPROFILE%\Local Settings\Application Data
+//     et %APPDATA% par %USERPROFILE%\Application Data. ---
 const HELP_LOCATIONS: { b: string; win: string; other: string }[] = [
   {
     b: "Chrome",
@@ -427,22 +526,42 @@ const HELP_LOCATIONS: { b: string; win: string; other: string }[] = [
   {
     b: "Edge (Chromium)",
     win: "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default",
-    other: "macOS : ~/Library/Application Support/Microsoft Edge/Default",
+    other: "macOS : ~/Library/Application Support/Microsoft Edge/Default · Linux : ~/.config/microsoft-edge/Default",
   },
   {
     b: "Brave",
     win: "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default",
-    other: "Linux : ~/.config/BraveSoftware/Brave-Browser/Default",
+    other: "macOS : ~/Library/Application Support/BraveSoftware/Brave-Browser/Default · Linux : ~/.config/BraveSoftware/Brave-Browser/Default",
   },
   {
     b: "Opera",
     win: "%APPDATA%\\Opera Software\\Opera Stable",
-    other: "macOS : ~/Library/Application Support/com.operasoftware.Opera",
+    other: "macOS : ~/Library/Application Support/com.operasoftware.Opera · Linux : ~/.config/opera",
+  },
+  {
+    b: "Opera GX",
+    win: "%APPDATA%\\Opera Software\\Opera GX Stable",
+    other: "macOS : ~/Library/Application Support/com.operasoftware.OperaGX",
   },
   {
     b: "Vivaldi",
     win: "%LOCALAPPDATA%\\Vivaldi\\User Data\\Default",
-    other: "",
+    other: "macOS : ~/Library/Application Support/Vivaldi/Default · Linux : ~/.config/vivaldi/Default",
+  },
+  {
+    b: "Yandex",
+    win: "%LOCALAPPDATA%\\Yandex\\YandexBrowser\\User Data\\Default",
+    other: "macOS : ~/Library/Application Support/Yandex/YandexBrowser/Default",
+  },
+  {
+    b: "Chromium",
+    win: "%LOCALAPPDATA%\\Chromium\\User Data\\Default",
+    other: "Linux : ~/.config/chromium/Default",
+  },
+  {
+    b: "Arc",
+    win: "%LOCALAPPDATA%\\Packages\\TheBrowserCompany.Arc_*\\LocalCache\\…\\User Data\\Default",
+    other: "macOS : ~/Library/Application Support/Arc/User Data/Default",
   },
   {
     b: "Firefox",
@@ -455,17 +574,95 @@ const HELP_LOCATIONS: { b: string; win: string; other: string }[] = [
     other: "macOS : ~/Library/Safari (History.db, Bookmarks.plist, Downloads.plist)",
   },
   {
+    b: "Samsung Internet",
+    win: "— (mobile uniquement — voir tableau Mobile)",
+    other: "—",
+  },
+  {
+    b: "UC Browser",
+    win: "%APPDATA%\\UCBrowser (ancien, surtout mobile)",
+    other: "—",
+  },
+  {
     b: "IE / Edge Legacy",
     win: "%LOCALAPPDATA%\\Microsoft\\Windows\\WebCache\\WebCacheV01.dat",
-    other: "",
+    other: "—",
+  },
+];
+
+// --- Référentiel mobile. iOS 14→27 : conteneurs d'app (GUID aléatoire) sous
+//     /private/var/mobile/Containers/Data/Application/<GUID>/ (extraction de
+//     système de fichiers complète : Cellebrite FFS, GrayKey, checkm8…).
+//     Android 12→16 : /data/data/<paquet>/ (extraction physique / FFS). ---
+const HELP_MOBILE: { b: string; ios: string; android: string }[] = [
+  {
+    b: "Safari",
+    ios: "/private/var/mobile/Library/Safari/History.db · …/Bookmarks.db · SuspendState",
+    android: "— (iOS uniquement)",
+  },
+  {
+    b: "Chrome",
+    ios: "com.google.chrome.ios → <GUID>/Library/Application Support/Google/Chrome/Default/History",
+    android: "com.android.chrome → app_chrome/Default/History, Cookies, Login Data",
+  },
+  {
+    b: "Edge",
+    ios: "com.microsoft.msedge → <GUID>/Library/Application Support/.../Default/History",
+    android: "com.microsoft.emmx → app_chrome/Default/History",
+  },
+  {
+    b: "Firefox",
+    ios: "org.mozilla.ios.Firefox → <GUID>/…/profile.profile/places.sqlite (ou browser.db)",
+    android: "org.mozilla.firefox → files/<profil>/places.sqlite, cookies.sqlite",
+  },
+  {
+    b: "Samsung Internet",
+    ios: "— (Android uniquement)",
+    android: "com.sec.android.app.sbrowser → app_sbrowser/Default/History",
+  },
+  {
+    b: "Opera / Opera GX",
+    ios: "com.opera.OperaTouch · com.opera.mini.ios → <GUID>/…/History",
+    android: "com.opera.browser · com.opera.gx → app_opera/.../History",
+  },
+  {
+    b: "Opera Mini",
+    ios: "com.opera.mini.ios",
+    android: "com.opera.mini.native → files/ (format propriétaire)",
+  },
+  {
+    b: "UC Browser",
+    ios: "com.ucweb.iosbrowser",
+    android: "com.UCMobile.intl / com.ucmobile → …/UCDownloads, bases SQLite d'historique",
+  },
+  {
+    b: "Brave",
+    ios: "com.brave.ios.browser → <GUID>/…/Default/History",
+    android: "com.brave.browser → app_chrome/Default/History",
+  },
+  {
+    b: "Vivaldi",
+    ios: "— (surtout Android)",
+    android: "com.vivaldi.browser → app_vivaldi/Default/History",
+  },
+  {
+    b: "Yandex",
+    ios: "ru.yandex.mobile.search",
+    android: "com.yandex.browser → app_yandex/Default/History",
+  },
+  {
+    b: "Arc",
+    ios: "company.thebrowser.arc → <GUID>/…/User Data/Default/History",
+    android: "— (pas d'application Android)",
   },
 ];
 
 // fichiers clés à fournir par navigateur
 const HELP_FILES =
-  "Chromium (Chrome/Edge/Brave/Opera/Vivaldi) : History, Cookies (ou Network\\Cookies), Web Data, Login Data, Bookmarks, Shortcuts, Top Sites, Favicons, Preferences. " +
-  "Firefox : places.sqlite, cookies.sqlite, formhistory.sqlite, logins.json, favicons.sqlite, sessionstore.jsonlz4. " +
-  "Safari : History.db, Bookmarks.plist, Downloads.plist. IE/Edge Legacy : WebCacheV01.dat.";
+  "Chromium (Chrome/Edge/Brave/Opera/Vivaldi/Yandex/Arc/Samsung/UC) : History, Cookies (ou Network\\Cookies), Web Data, Login Data, Bookmarks, Shortcuts, Top Sites, Favicons, Preferences. " +
+  "Firefox (bureau & Fenix Android) : places.sqlite, cookies.sqlite, formhistory.sqlite, logins.json, favicons.sqlite, sessionstore.jsonlz4. " +
+  "Safari (macOS & iOS) : History.db, Bookmarks.plist/db, Downloads.plist. IE/Edge Legacy : WebCacheV01.dat. " +
+  "L'auto-détection repose sur le CONTENU (signatures + tables SQLite) : elle reconnaît ces bases quel que soit le chemin, y compris depuis une extraction de système de fichiers mobile montée en dossier.";
 
 // signature stable d'une ligne (independante du fuseau), pour le marquage
 function rowSig(r: Row, columns: string[]): string {
@@ -477,6 +674,74 @@ function rowSig(r: Row, columns: string[]): string {
     })
     .join("␟");
 }
+// colonnes et lignes d'une liste de marquages (vues « Éléments marqués » et
+// « Recherches / mots-clés » restreintes aux éléments marqués)
+const TAG_COLUMNS = [
+  "Marqueur",
+  "Navigateur",
+  "Source (chemin)",
+  "Date fichier",
+  "Taille",
+  "Élément",
+  "Note",
+  "Marqué le",
+];
+// origines de marquage rattachées à la vue Résultats (recherches)
+const KW_ORIGINS = ["kw", "search"];
+// catégories métier des éléments d'identité (types produits par le moteur) ;
+// tout type non listé tombe dans « Autres »
+const IDENT_GROUPS: { key: string; label: string; icon: string; types: string[] }[] = [
+  { key: "paiement", label: "Moyens de paiement", icon: "💳", types: ["Carte bancaire", "IBAN / banque", "Banque"] },
+  { key: "telephone", label: "Téléphones", icon: "📞", types: ["Telephone"] },
+  { key: "email", label: "Emails", icon: "✉️", types: ["Email"] },
+  { key: "adresse", label: "Adresses", icon: "🏠", types: ["Adresse"] },
+  { key: "civil", label: "Identité civile", icon: "🪪", types: ["Nom / Prenom", "Date de naissance"] },
+  { key: "secu", label: "Sécurité sociale", icon: "🛡️", types: ["Securite sociale (NIR)", "Securite sociale"] },
+  { key: "vehicule", label: "Véhicules", icon: "🚗", types: ["Immatriculation", "Vehicule / immatriculation"] },
+];
+const IDENT_OTHER = { key: "autres", label: "Autres", icon: "📁" };
+function identGroupOf(type: string): string {
+  const g = IDENT_GROUPS.find((x) => x.types.includes(type));
+  return g ? g.key : IDENT_OTHER.key;
+}
+// origine d'après la vue où l'on marque (recherche globale, mots-clés, Résultats)
+function viewOrigin(kind: string | undefined): string {
+  if (kind === "keywords" || kind === "kwresults") return "kw";
+  if (kind === "search") return "search";
+  return "";
+}
+// origine d'un marquage : celle enregistrée, sinon déduite du titre de la vue
+// d'origine (marquages faits avant l'enregistrement de l'origine)
+function tagOrigin(t: TagEntry): string {
+  if (t.origin) return t.origin;
+  const c = t.context ?? "";
+  if (c.startsWith("Recherche :")) return "search";
+  if (c.startsWith("Recherche par mots-clés") || c.startsWith("Recherches / mots-clés")) return "kw";
+  return "";
+}
+function tagRows(list: TagEntry[]): { columns: string[]; rows: Row[] } {
+  const rows: Row[] = list.map((t) => ({
+    values: {
+      Marqueur: { t: "text", v: t.label },
+      Navigateur: { t: "text", v: t.browser },
+      "Source (chemin)": { t: "text", v: t.path },
+      "Date fichier": t.modified != null ? { t: "time", v: t.modified } : { t: "null" },
+      Taille: t.size != null ? { t: "int", v: t.size } : { t: "null" },
+      Élément: { t: "text", v: t.summary },
+      Note: { t: "text", v: t.note },
+      "Marqué le": { t: "text", v: t.when },
+      _sig: { t: "text", v: t.sig },
+      _couleur: { t: "text", v: t.color },
+    },
+    raw: [],
+  }));
+  return { columns: TAG_COLUMNS, rows };
+}
+// nombre de correspondances réelles (hors ligne « aucun résultat »)
+function countHits(rows: Row[]): number {
+  return rows.filter((r) => cellText(r.values["Valeur"]) !== "(aucun résultat)").length;
+}
+
 function rowSummary(r: Row, columns: string[], tz: string): string {
   // Conserve l'intégralité des colonnes visibles de la ligne (et non les 3
   // premières seulement) afin qu'un marquage retienne tout le résultat —
@@ -559,6 +824,19 @@ export function App() {
   const [htmls, setHtmls] = useState<HtmlItem[]>([]);
   const [htmlView, setHtmlView] = useState<HtmlItem | null>(null);
   const [gsearch, setGsearch] = useState<string>("");
+  // Compteurs « trouvés » de la vue Résultats : correspondances de mots-clés
+  // (session) et de recherches globales (par terme, session).
+  const [kwFound, setKwFound] = useState<number>(0);
+  const [searchFound, setSearchFound] = useState<Record<string, number>>({});
+  // Nombre d'éléments de chaque entrée de la colonne Résultats (moteur).
+  const [resCounts, setResCounts] = useState<Record<string, number>>({});
+  // Nombre d'éléments d'identité par type (sous-catégories de la colonne Résultats).
+  const [identCounts, setIdentCounts] = useState<Record<string, number>>({});
+  // Déchiffrement des mots de passe Firefox (NSS).
+  const [fxPwd, setFxPwd] = useState<string>("");
+  const [fxDir, setFxDir] = useState<string | null>(null);
+  const [showFxPrompt, setShowFxPrompt] = useState<boolean>(false);
+  const [fxPromptVal, setFxPromptVal] = useState<string>("");
   const [sortCol, setSortCol] = useState<string | null>(null);
   const [sortAsc, setSortAsc] = useState<boolean>(true);
   const [detail, setDetail] = useState<Row | null>(null);
@@ -583,11 +861,27 @@ export function App() {
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
+  const refreshResCounts = useCallback(() => {
+    api.resultsCounts().then(setResCounts).catch(() => {});
+    api
+      .identity()
+      .then((v) => {
+        const c: Record<string, number> = {};
+        for (const r of v.rows) {
+          const t = cellText(r.values["Type"]) || "Autre";
+          c[t] = (c[t] ?? 0) + 1;
+        }
+        setIdentCounts(c);
+      })
+      .catch(() => {});
+  }, []);
+
   const refreshOverview = useCallback(async () => {
     try {
       const [ov, gr] = await Promise.all([api.overview(), api.browserGroups()]);
       setOver(ov);
       setGroups(gr);
+      refreshResCounts();
     } catch (e) {
       const txt = e instanceof Error ? e.message : String(e);
       await message(txt, { title: "NavForensics — erreur", kind: "error" });
@@ -598,6 +892,7 @@ export function App() {
     refreshOverview();
     api.listTags().then(setTags).catch(() => {});
     api.version().then(setAppVersion).catch(() => {});
+    api.kwResults().then((v) => setKwFound(countHits(v.rows))).catch(() => {});
   }, [refreshOverview]);
 
   // index des signatures marquees + acces par signature
@@ -647,6 +942,7 @@ export function App() {
         setView({ title: "Regroupement par domaine", sha: "—", ...v });
       } else if (sel.kind === "search") {
         const v = await api.search(sel.term);
+        setSearchFound((prev) => ({ ...prev, [sel.term]: v.rows.length }));
         setView({ title: `Recherche : « ${sel.term} »`, sha: "—", ...v });
       } else if (sel.kind === "flagged") {
         const v = await api.flagged(sel.browser);
@@ -676,7 +972,19 @@ export function App() {
         setView({ title: "Services en ligne (cloud / webmail / réseaux)", sha: "—", ...v });
       } else if (sel.kind === "identity") {
         const v = await api.identity();
-        setView({ title: "Éléments d'identité (autofill)", sha: "—", ...v });
+        let rows = v.rows;
+        let title = "Éléments d'identité (autofill)";
+        if (sel.type) {
+          const t = sel.type;
+          rows = rows.filter((r) => cellText(r.values["Type"]) === t);
+          title = `Éléments d'identité — ${t}`;
+        } else if (sel.group) {
+          const g = sel.group;
+          rows = rows.filter((r) => identGroupOf(cellText(r.values["Type"])) === g);
+          const lbl = IDENT_GROUPS.find((x) => x.key === g)?.label ?? IDENT_OTHER.label;
+          title = `Éléments d'identité — ${lbl}`;
+        }
+        setView({ title, sha: "—", columns: v.columns, rows });
       } else if (sel.kind === "downloads") {
         const v = await api.downloads();
         setView({ title: "Téléchargements", sha: "—", ...v });
@@ -693,8 +1001,20 @@ export function App() {
         const v = await api.crypto();
         setView({ title: "Crypto-actifs", sha: "—", ...v });
       } else if (sel.kind === "kwresults") {
-        const v = await api.kwResults();
-        setView({ title: "Recherches / mots-clés", sha: "—", ...v });
+        // Résultats : uniquement les éléments marqués issus de la recherche par
+        // mots-clés ou de la recherche globale.
+        const picked = tags.filter((t) => KW_ORIGINS.includes(tagOrigin(t)));
+        const { columns, rows } = tagRows(picked);
+        setView({
+          title: `Recherches / mots-clés — éléments marqués (${picked.length})`,
+          sha: "—",
+          columns,
+          rows,
+        });
+      } else if (sel.kind === "fxpasswords") {
+        const v = await api.firefoxPasswords(fxPwd, fxDir);
+        refreshResCounts();
+        setView({ title: "Mots de passe Firefox (déchiffrés)", sha: "—", ...v });
       } else if (sel.kind === "ioc") {
         const v = await api.iocResults();
         setView({ title: "Correspondances IOC", sha: "—", ...v });
@@ -713,44 +1033,23 @@ export function App() {
         setView({ title: `Pattern of life (jour × heure, ${zone})`, sha: "—", ...v });
       } else if (sel.kind === "keywords") {
         const v = await api.keywordSearch(kwQuery);
+        // met à jour le compteur « trouvés » de la vue Résultats
+        const acc = await api.kwResults().catch(() => null);
+        if (acc) setKwFound(countHits(acc.rows));
         setView({
           title: `Recherche par mots-clés (${kwQuery.length} termes)`,
           sha: "—",
           ...v,
         });
       } else if (sel.kind === "tags") {
-        const columns = [
-          "Marqueur",
-          "Navigateur",
-          "Source (chemin)",
-          "Date fichier",
-          "Taille",
-          "Élément",
-          "Note",
-          "Marqué le",
-        ];
-        const rows: Row[] = tags.map((t) => ({
-          values: {
-            Marqueur: { t: "text", v: t.label },
-            Navigateur: { t: "text", v: t.browser },
-            "Source (chemin)": { t: "text", v: t.path },
-            "Date fichier": t.modified != null ? { t: "time", v: t.modified } : { t: "null" },
-            Taille: t.size != null ? { t: "int", v: t.size } : { t: "null" },
-            Élément: { t: "text", v: t.summary },
-            Note: { t: "text", v: t.note },
-            "Marqué le": { t: "text", v: t.when },
-            _sig: { t: "text", v: t.sig },
-            _couleur: { t: "text", v: t.color },
-          },
-          raw: [],
-        }));
+        const { columns, rows } = tagRows(tags);
         setView({ title: `Éléments marqués (${tags.length})`, sha: "—", columns, rows });
       }
     } catch (e) {
       const txt = e instanceof Error ? e.message : String(e);
       await message(txt, { title: "NavForensics — erreur", kind: "error" });
     }
-  }, [sel, noisy, over, tags, kwQuery, tz]);
+  }, [sel, noisy, over, tags, kwQuery, tz, fxPwd, fxDir]);
 
   useEffect(() => {
     loadView();
@@ -818,6 +1117,7 @@ export function App() {
       if (!picked) return;
       const path = Array.isArray(picked) ? picked[0] : picked;
       const v = await api.iocLoad(path);
+      refreshResCounts();
       setSel({ kind: "ioc" });
       await message(`${v.rows.length} correspondance(s) trouvée(s).`, {
         title: "NavForensics",
@@ -970,18 +1270,43 @@ export function App() {
     return rows;
   }, [view, filter, tz, sortCol, sortAsc, dateFrom, dateTo, sel, timeSel]);
 
-  // largeurs par defaut (selon le nom de colonne)
+  // largeurs « naturelles » (selon le nom de colonne)
   const defaultWidths = useMemo<number[]>(() => {
     if (!view) return [];
     return view.columns.map((c) => Math.min(Math.max(c.length * 9, 110), 420));
   }, [view]);
 
+  // largeur disponible du tableau (suivie en temps réel pour l'auto-ajustement)
+  const [availW, setAvailW] = useState(0);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setAvailW(el.clientWidth));
+    ro.observe(el);
+    setAvailW(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+
+  // largeurs de base : étirées pour remplir la fenêtre quand elles tiennent,
+  // sinon largeurs naturelles (défilement horizontal). S'applique à tous les onglets.
+  const baseWidths = useMemo<number[]>(() => {
+    if (defaultWidths.length === 0) return defaultWidths;
+    const natural = defaultWidths.reduce((a, b) => a + b, 0);
+    const target = availW > 2 ? availW - 2 : natural;
+    if (natural <= 0 || target <= natural) return defaultWidths;
+    const k = target / natural;
+    const arr = defaultWidths.map((w) => Math.floor(w * k));
+    const diff = target - arr.reduce((a, b) => a + b, 0);
+    if (arr.length) arr[arr.length - 1] += diff;
+    return arr;
+  }, [defaultWidths, availW]);
+
   // largeurs effectives, redimensionnables par l'utilisateur
   const [colW, setColW] = useState<number[]>([]);
   useEffect(() => {
-    setColW(defaultWidths);
-  }, [defaultWidths]);
-  const widths = colW.length === defaultWidths.length ? colW : defaultWidths;
+    setColW(baseWidths);
+  }, [baseWidths]);
+  const widths = colW.length === baseWidths.length ? colW : baseWidths;
   const totalWidth = useMemo(() => widths.reduce((a, b) => a + b, 0), [widths]);
 
   // Évènements datés de la vue courante (pour la timeline interactive, sur
@@ -1070,12 +1395,12 @@ export function App() {
       e.preventDefault();
       e.stopPropagation();
       setColW((prev) => {
-        const base = prev.length ? prev.slice() : defaultWidths.slice();
-        base[idx] = defaultWidths[idx];
+        const base = prev.length ? prev.slice() : baseWidths.slice();
+        base[idx] = baseWidths[idx];
         return base;
       });
     },
-    [defaultWidths]
+    [baseWidths]
   );
 
   const rowVirt = useVirtualizer({
@@ -1107,7 +1432,7 @@ export function App() {
 
   const exportTable = async (format: "csv" | "xlsx") => {
     if (!view || !sel) return;
-    if (sel.kind === "tags" || sel.kind === "keywords") {
+    if (sel.kind === "tags" || sel.kind === "keywords" || sel.kind === "kwresults") {
       await message(
         "Export direct non disponible pour cette vue. Utilisez le rapport HTML (éléments marqués) ou une autre vue.",
         { title: "NavForensics" }
@@ -1227,8 +1552,10 @@ export function App() {
       const now = new Date().toISOString();
       const entries: TagEntry[] = rows.map((r) => {
         const src = sourceForRow(r);
+        const sig = sigOf(r, view.columns);
+        const prev = tagBySig.get(sig);
         return {
-          sig: sigOf(r, view.columns),
+          sig,
           label: tagLabel,
           color: tagColor,
           note: tagNote,
@@ -1239,6 +1566,7 @@ export function App() {
           path: src.path,
           modified: src.modified,
           size: src.size,
+          origin: (prev && tagOrigin(prev)) || viewOrigin(sel?.kind),
         };
       });
       await api.setTags(entries);
@@ -1307,10 +1635,17 @@ export function App() {
     setShowKw(false);
   };
 
+  const runFxDecrypt = () => {
+    setFxPwd(fxPromptVal);
+    setShowFxPrompt(false);
+    setSel({ kind: "fxpasswords" });
+  };
+
   // --- marquage / annotation ---
   const refreshTags = async () => {
     try {
       setTags(await api.listTags());
+      refreshResCounts();
     } catch (e) {
       await reportError(e);
     }
@@ -1319,8 +1654,10 @@ export function App() {
     if (!detail || !view) return;
     try {
       const src = sourceForRow(detail);
+      const sig = sigOf(detail, view.columns);
+      const prev = tagBySig.get(sig);
       await api.setTag({
-        sig: sigOf(detail, view.columns),
+        sig,
         label: tagLabel,
         color: tagColor,
         note: tagNote,
@@ -1331,6 +1668,7 @@ export function App() {
         path: src.path,
         modified: src.modified,
         size: src.size,
+        origin: (prev && tagOrigin(prev)) || viewOrigin(sel?.kind),
       });
       await refreshTags();
       setDetail(null);
@@ -1504,62 +1842,138 @@ export function App() {
                 onClick={() => setShowKw(true)}
               >🔑 Recherche par mots-clés</div>
               <div className="navhdr navsub">Résultats</div>
-              <div
-                className={"node top" + (sel?.kind === "identity" ? " sel" : "")}
-                onClick={() => setSel({ kind: "identity" })}
-              >🪪 Éléments d'identité</div>
+              {(() => {
+                const toggle = (k: string) =>
+                  setCollapsed((prev) => {
+                    const n = new Set(prev);
+                    if (n.has(k)) n.delete(k);
+                    else n.add(k);
+                    return n;
+                  });
+                const idOpen = !collapsed.has("identity");
+                return (
+                  <>
+                    <div
+                      className={
+                        "node top" +
+                        (sel?.kind === "identity" && !sel.group && !sel.type ? " sel" : "")
+                      }
+                      onClick={() => setSel({ kind: "identity" })}
+                    >
+                      <span
+                        className="chev"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggle("identity");
+                        }}
+                      >
+                        {idOpen ? "▾" : "▸"}
+                      </span>
+                      🪪 Éléments d'identité ({resCounts.identity ?? 0})
+                    </div>
+                    {idOpen &&
+                      [...IDENT_GROUPS, IDENT_OTHER].map((g) => {
+                        const types = Object.keys(identCounts)
+                          .filter((t) => identGroupOf(t) === g.key)
+                          .sort((a, b) => identCounts[b] - identCounts[a]);
+                        if (types.length === 0) return null;
+                        const total = types.reduce((a, t) => a + identCounts[t], 0);
+                        const gKey = "identity:" + g.key;
+                        const gOpen = !collapsed.has(gKey);
+                        const gOn = sel?.kind === "identity" && sel.group === g.key && !sel.type;
+                        return (
+                          <div key={g.key}>
+                            <div
+                              className={"node subhdr" + (gOn ? " sel" : "")}
+                              onClick={() => setSel({ kind: "identity", group: g.key })}
+                            >
+                              <span
+                                className="chev"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggle(gKey);
+                                }}
+                              >
+                                {gOpen ? "▾" : "▸"}
+                              </span>
+                              {g.icon} {g.label} ({total})
+                            </div>
+                            {gOpen &&
+                              types.map((t) => {
+                                const on = sel?.kind === "identity" && sel.type === t;
+                                return (
+                                  <div
+                                    key={t}
+                                    className={"node child" + (on ? " sel" : "")}
+                                    onClick={() => setSel({ kind: "identity", type: t })}
+                                  >
+                                    {t} ({identCounts[t]})
+                                  </div>
+                                );
+                              })}
+                          </div>
+                        );
+                      })}
+                  </>
+                );
+              })()}
               <div
                 className={"node top" + (sel?.kind === "downloads" ? " sel" : "")}
                 onClick={() => setSel({ kind: "downloads" })}
-              >⬇️ Téléchargements</div>
+              >⬇️ Téléchargements ({resCounts.downloads ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "geolocation" ? " sel" : "")}
                 onClick={() => setSel({ kind: "geolocation" })}
-              >📍 Géolocalisations</div>
+              >📍 Géolocalisations ({resCounts.geolocation ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "vpn" ? " sel" : "")}
                 onClick={() => setSel({ kind: "vpn" })}
-              >🛡️ VPN / anonymiseurs</div>
+              >🛡️ VPN / anonymiseurs ({resCounts.vpn ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "recovered" ? " sel" : "")}
                 onClick={() => setSel({ kind: "recovered" })}
                 title="Enregistrements supprimés récupérés par carving SQLite"
-              >♻️ Récupérés (supprimés)</div>
+              >♻️ Récupérés (supprimés) ({resCounts.recovered ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "crypto" ? " sel" : "")}
                 onClick={() => setSel({ kind: "crypto" })}
                 title="Adresses crypto, plateformes et phrases mnémoniques possibles"
-              >₿ Crypto-actifs</div>
+              >₿ Crypto-actifs ({resCounts.crypto ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "kwresults" ? " sel" : "")}
                 onClick={() => setSel({ kind: "kwresults" })}
-                title="Tous les résultats des recherches par mots-clés de la session"
-              >🔑 Recherches / mots-clés</div>
+                title="Éléments marqués issus des recherches par mots-clés et de la recherche globale"
+              >🔑 Recherches / mots-clés ({tags.filter((t) => KW_ORIGINS.includes(tagOrigin(t))).length} tagués · {kwFound + Object.values(searchFound).reduce((a, b) => a + b, 0)} trouvés)</div>
+              <div
+                className={"node top" + (sel?.kind === "fxpasswords" ? " sel" : "")}
+                onClick={() => { setFxPromptVal(fxPwd); setShowFxPrompt(true); }}
+                title="Déchiffre les mots de passe enregistrés dans Firefox (key4.db + logins.json)"
+              >🔓 Mots de passe Firefox ({resCounts.fxpasswords ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "ioc" ? " sel" : "")}
                 onClick={() => setSel({ kind: "ioc" })}
                 title="Correspondances de la liste de surveillance (IOC) chargée"
-              >🎯 Correspondances IOC</div>
+              >🎯 Correspondances IOC ({resCounts.ioc ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "sync" ? " sel" : "")}
                 onClick={() => setSel({ kind: "sync" })}
                 title="Comptes de synchronisation liés aux profils"
-              >🔄 Comptes synchronisés</div>
+              >🔄 Comptes synchronisés ({resCounts.sync ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "extensions" ? " sel" : "")}
                 onClick={() => setSel({ kind: "extensions" })}
                 title="Extensions installées et leurs permissions"
-              >🧩 Extensions</div>
+              >🧩 Extensions ({resCounts.extensions ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "geopoints" ? " sel" : "")}
                 onClick={() => setSel({ kind: "geopoints" })}
                 title="Coordonnées GPS extraites des URLs (carte dans le rapport)"
-              >🗺️ Points géolocalisés</div>
+              >🗺️ Points géolocalisés ({resCounts.geopoints ?? 0})</div>
               <div
                 className={"node top" + (sel?.kind === "heatmap" ? " sel" : "")}
                 onClick={() => setSel({ kind: "heatmap" })}
                 title="Répartition de l'activité par jour et heure"
-              >🔥 Pattern of life</div>
+              >🔥 Pattern of life ({resCounts.heatmap ?? 0})</div>
               {media.length > 0 && (
                 <div
                   className={"node top" + (sel?.kind === "media" ? " sel" : "")}
@@ -1968,7 +2382,8 @@ export function App() {
               <div className="k">Principe forensique</div>
               <div className="v">
                 Lecture seule sur une copie (fichiers -wal/-shm inclus), empreinte SHA-256,
-                horodatages convertis depuis chaque référentiel navigateur, aucun secret déchiffré.
+                horodatages convertis depuis chaque référentiel navigateur. Déchiffrement des
+                identifiants Firefox disponible (key4.db + logins.json, sur copie).
               </div>
             </div>
             <hr />
@@ -1979,10 +2394,13 @@ export function App() {
               • <b>Fichiers</b> : charge une ou plusieurs bases précises.
             </div>
             <hr />
-            <div className="k">Emplacements des profils utilisateur</div>
+            <div className="k">Emplacements des profils — Bureau (Windows / macOS / Linux)</div>
+            <div className="v" style={{ marginBottom: 6 }}>
+              Windows XP : remplacer <span className="mono">%LOCALAPPDATA%</span> par <span className="mono">%USERPROFILE%\Local Settings\Application Data</span> et <span className="mono">%APPDATA%</span> par <span className="mono">%USERPROFILE%\Application Data</span>. Chemins identiques de Windows Vista à 11 (26H2).
+            </div>
             <table className="helptab">
               <thead>
-                <tr><th>Navigateur</th><th>Windows</th><th>Autres OS</th></tr>
+                <tr><th>Navigateur</th><th>Windows</th><th>macOS / Linux</th></tr>
               </thead>
               <tbody>
                 {HELP_LOCATIONS.map((h) => (
@@ -1994,11 +2412,64 @@ export function App() {
                 ))}
               </tbody>
             </table>
+            <div className="k" style={{ marginTop: 10 }}>Emplacements des profils — Mobile (iOS 14→27 / Android 12→16)</div>
+            <div className="v" style={{ marginBottom: 6 }}>
+              Nécessite une extraction de système de fichiers complète (Cellebrite FFS, GrayKey, checkm8 pour iOS ; extraction physique / FFS pour Android), puis « Dossier » pour scanner l'arborescence montée. iOS : conteneur d'app sous <span className="mono">/private/var/mobile/Containers/Data/Application/&lt;GUID&gt;/</span>. Android : <span className="mono">/data/data/&lt;paquet&gt;/</span>.
+            </div>
+            <table className="helptab">
+              <thead>
+                <tr><th>Navigateur</th><th>iOS (bundle → base)</th><th>Android (paquet → base)</th></tr>
+              </thead>
+              <tbody>
+                {HELP_MOBILE.map((h) => (
+                  <tr key={h.b}>
+                    <td>{h.b}</td>
+                    <td className="mono">{h.ios}</td>
+                    <td className="mono">{h.android}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
             <div className="field">
               <div className="k">Fichiers clés</div>
               <div className="v">{HELP_FILES}</div>
             </div>
             <button className="btn" onClick={() => setShowHelp(false)}>Fermer</button>
+          </div>
+        </div>
+      )}
+
+      {showFxPrompt && (
+        <div className="overlay" onClick={() => setShowFxPrompt(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Mots de passe Firefox — déchiffrement</h3>
+            <div className="v" style={{ marginBottom: 8 }}>
+              Déchiffre les identifiants enregistrés (<span className="mono">key4.db</span> + <span className="mono">logins.json</span>). Laissez le champ vide s'il n'y a pas de mot de passe maître. Lecture seule sur copie.
+            </div>
+            <label className="k">Mot de passe maître (optionnel)</label>
+            <input
+              type="password"
+              value={fxPromptVal}
+              onChange={(e) => setFxPromptVal(e.target.value)}
+              placeholder="(vide si aucun)"
+              autoFocus
+              onKeyDown={(e) => { if (e.key === "Enter") runFxDecrypt(); }}
+            />
+            <div className="v" style={{ margin: "8px 0", fontSize: 12 }}>
+              Profil : {fxDir ? <span className="mono">{fxDir}</span> : "profils Firefox chargés (auto)"}
+            </div>
+            <div className="tagbtns">
+              <button
+                className="btn"
+                onClick={async () => {
+                  const d = await open({ directory: true, title: "Dossier de profil Firefox (key4.db + logins.json)" });
+                  if (d && !Array.isArray(d)) setFxDir(d);
+                }}
+              >📁 Choisir un profil…</button>
+              {fxDir && <button className="btn" onClick={() => setFxDir(null)}>↺ Auto</button>}
+              <button className="btn" onClick={runFxDecrypt}>🔓 Déchiffrer</button>
+              <button className="btn" onClick={() => setShowFxPrompt(false)}>Annuler</button>
+            </div>
           </div>
         </div>
       )}

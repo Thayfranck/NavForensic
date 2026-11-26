@@ -76,6 +76,7 @@ export interface TagEntry {
   path: string;
   modified: number | null;
   size: number | null;
+  origin?: string;
 }
 
 export interface CaseInfo {
@@ -172,6 +173,9 @@ export const api = {
   kwResults: () => invoke<ViewData>("kw_results_view"),
   iocLoad: (path: string) => invoke<ViewData>("ioc_load", { path }),
   iocResults: () => invoke<ViewData>("ioc_results_view"),
+  resultsCounts: () => invoke<Record<string, number>>("results_counts"),
+  firefoxPasswords: (masterPassword: string, dir?: string | null) =>
+    invoke<ViewData>("firefox_passwords", { masterPassword, dir: dir ?? null }),
   syncAccounts: () => invoke<ViewData>("sync_accounts"),
   extensions: () => invoke<ViewData>("extensions"),
   geopoints: () => invoke<ViewData>("geopoints"),
