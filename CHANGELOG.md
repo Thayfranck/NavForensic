@@ -4,6 +4,24 @@ Toutes les modifications notables de NavForensics sont consignées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ;
 le versionnement suit [SemVer](https://semver.org/lang/fr/) à partir de 2.x.
 
+## [2.9.0]
+
+### Ajouté
+- **Lecture des volumes ext4 (Android)** dans une image E01 ou brute, en lecture
+  seule (`ext4-view`). Le lecteur repère les volumes par signature et lit
+  `data/data/<paquet>/` puis `data/user/0/<paquet>/` : Chrome, Edge, Samsung
+  Internet, Opera et Firefox Android. Les profils sont extraits sous
+  `android/<paquet>/`.
+- **Détection par signature** des systèmes de fichiers : NTFS, ext4, APFS, F2FS.
+- Message explicite lorsqu'un volume APFS (iOS, macOS) ou F2FS (Android récent)
+  est détecté mais non lu, au lieu d'un échec silencieux.
+
+### Limites
+- APFS et F2FS ne sont pas lus. Beaucoup d'Android récents utilisent F2FS pour
+  la partition de données : dans ce cas, extraire le système de fichiers
+  (Cellebrite FFS, GrayKey…) puis l'ouvrir avec « Dossier ».
+- Les chemins Opera et Samsung Internet Android sont à vérifier sur image réelle.
+
 ## [2.8.0]
 
 ### Ajouté

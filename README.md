@@ -1,4 +1,4 @@
-# NavForensics 2.8.0 (Tauri + React)
+# NavForensics 2.9.0 (Tauri + React)
 
 NavForensics est une application de bureau forensique écrite en Rust (Tauri 2) + React/TypeScript. Elle lit **en lecture seule** les bases de données des navigateurs extraites via X-Ways ou d'une image E01 (Chromium, Firefox, Safari, Internet Explorer / Edge Legacy, sur bureau comme sur mobile), en tire des vues d'analyse (chronologie interactive, domaines, identité, géolocalisations, téléchargements, VPN, crypto-actifs, mots de passe Firefox, etc.), **récupère les enregistrements supprimés** par carving SQLite, et génère un rapport horodaté — **HTML ou PDF** — avec empreinte **SHA-256** pour chaque export.
 
@@ -130,7 +130,7 @@ cargo test -p navforensics-engine
 
 Extraction directe des artefacts de navigateurs depuis une image forensique E01 (EWF, crate `ewf`) ou brute (`.dd`/`.001`/`.raw`) : partitions MBR/GPT, volume NTFS en lecture seule (crate `ntfs-core`), parcours des profils sous `Users/<user>/AppData` (Chromium et variantes Yandex/Opera, Firefox, IE/Edge Legacy).
 
-Limite : une image E01 NTFS est un disque **Windows**. Les artefacts mobiles (iOS en APFS, Android en ext4/F2FS) ne sont pas lisibles par ce lecteur : pour le mobile, extraire le système de fichiers (Cellebrite FFS, GrayKey, checkm8…) puis l'ouvrir avec « Dossier ». Le panneau d'aide liste les chemins à extraire.
+Limites : une image E01 est lue pour ses volumes NTFS (Windows) et ext4 (Android, données applicatives). Les volumes **APFS** (iOS, macOS) et **F2FS** (Android récent) sont détectés mais ne sont pas lus : pour ces artefacts, extraire le système de fichiers (Cellebrite FFS, GrayKey, checkm8…) puis l'ouvrir avec « Dossier ». Le panneau d'aide liste les chemins à extraire.
 
 ### Chemins de profils (aide intégrée)
 
