@@ -1,6 +1,6 @@
 [package]
 name = "navforensics-engine"
-version = "2.4.1"
+version = "2.4.2"
 edition = "2021"
 description = "Coeur d'analyse forensique des bases de navigateurs (NavForensics)"
 

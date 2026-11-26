@@ -2477,7 +2477,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "navforensics"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "navforensics-engine",
  "serde",
@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "navforensics-engine"
-version = "2.4.1"
+version = "2.4.2"
 dependencies = [
  "chrono",
  "ese-core",

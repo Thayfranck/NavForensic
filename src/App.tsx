@@ -948,8 +948,9 @@ export function App() {
         return true;
       });
     }
-    // sélection de la timeline interactive (vue Chronologie)
-    if (sel?.kind === "timeline" && timeSel) {
+    // sélection de la timeline interactive (toutes vues datées) ; timeSel est
+    // remis à zéro à chaque changement de vue, donc filtrer dès qu'il est posé.
+    if (timeSel) {
       const [a, b] = timeSel;
       rows = rows.filter((r) => {
         const ms = rowTimeMs(r);
@@ -983,18 +984,20 @@ export function App() {
   const widths = colW.length === defaultWidths.length ? colW : defaultWidths;
   const totalWidth = useMemo(() => widths.reduce((a, b) => a + b, 0), [widths]);
 
-  // Évènements de la vue Chronologie (pour la timeline interactive).
+  // Évènements datés de la vue courante (pour la timeline interactive, sur
+  // toutes les vues qui portent des dates : chronologie, historiques, visites,
+  // termes recherchés, téléchargements, etc.).
   const allEvents = useMemo<TLEvent[]>(() => {
-    if (sel?.kind !== "timeline" || !view) return [];
+    if (!view) return [];
     const out: TLEvent[] = [];
     for (const r of view.rows) {
       const ms = rowTimeMs(r);
       if (ms == null) continue;
       const ty = r.values["Type"];
-      out.push({ t: ms, type: ty && ty.t === "text" ? ty.v : "Autre" });
+      out.push({ t: ms, type: ty && ty.t === "text" ? ty.v : "Consultations" });
     }
     return out;
-  }, [sel, view]);
+  }, [view]);
   const timeExtent = useMemo<[number, number] | null>(() => {
     if (allEvents.length === 0) return null;
     let lo = allEvents[0].t;
@@ -1006,6 +1009,9 @@ export function App() {
     if (hi <= lo) hi = lo + 86400000;
     return [lo, hi];
   }, [allEvents]);
+  // Vues sans timeline (visualisation propre ou sans date par ligne).
+  const TL_EXCLUDE = ["heatmap", "geopoints", "media", "domains", "stats", "histogram", "sync", "extensions"];
+  const showTimeline = !!timeExtent && !TL_EXCLUDE.includes(sel?.kind ?? "");
   // Réinitialise zoom et sélection en changeant de vue.
   useEffect(() => {
     setTimeWin(null);
@@ -1671,7 +1677,7 @@ export function App() {
             {sel?.kind === "geopoints" && (
               <GeoMap points={geoPoints} onOpen={(u) => api.openUrl(u).catch(() => {})} />
             )}
-            {sel?.kind === "timeline" && timeExtent && (
+            {showTimeline && timeExtent && (
               <TimelineBrush
                 events={allEvents}
                 extent={timeExtent}
