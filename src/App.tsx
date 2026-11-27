@@ -426,6 +426,7 @@ type Selection =
   | { kind: "crypto" }
   | { kind: "kwresults" }
   | { kind: "fxpasswords" }
+  | { kind: "chrpasswords"; browser: string }
   | { kind: "ioc" }
   | { kind: "sync" }
   | { kind: "extensions" }
@@ -664,6 +665,75 @@ const HELP_FILES =
   "Safari (macOS & iOS) : History.db, Bookmarks.plist/db, Downloads.plist. IE/Edge Legacy : WebCacheV01.dat. " +
   "L'auto-détection repose sur le CONTENU (signatures + tables SQLite) : elle reconnaît ces bases quel que soit le chemin, y compris depuis une extraction de système de fichiers mobile montée en dossier.";
 
+// guide d'utilisation affiché en tête du panneau d'aide
+const HELP_GUIDE: { t: string; items: string[] }[] = [
+  {
+    t: "1. Charger les artefacts",
+    items: [
+      "Auto-détection : profils des navigateurs installés sur ce poste (fermez-les d'abord).",
+      "Dossier : scan récursif d'un dossier de profils extraits (X-Ways, Cellebrite…).",
+      "Fichiers : une ou plusieurs bases précises.",
+      "Image E01 ou brute : lecture des volumes NTFS (Windows) et ext4 (Android). APFS (iOS, macOS) et F2FS (Android récent) ne sont pas lus.",
+    ],
+  },
+  {
+    t: "2. Naviguer",
+    items: [
+      "Colonne gauche : un bloc par navigateur, avec ses sous-onglets (historique, favoris, cookies, téléchargements…). Chaque entrée affiche son nombre entre parenthèses.",
+      "Colonne Résultats : éléments d'identité (par catégories dépliantes : paiement, téléphones, emails, adresses, identité civile, sécurité sociale, véhicules), téléchargements, géolocalisations, VPN, éléments récupérés, crypto-actifs, synchronisation, extensions, IOC, mots de passe Firefox, recherches / mots-clés, éléments marqués.",
+      "Les colonnes d'affichage s'adaptent automatiquement au contenu.",
+    ],
+  },
+  {
+    t: "3. Chronologie",
+    items: [
+      "Frise sous chaque vue datée : sélectionnez une période pour filtrer le tableau.",
+      "Clic droit maintenu et déplacement : déplacement dans la frise.",
+      "Survol : infobulle avec la date et le nombre d'éléments.",
+      "Au zoom sur 3 jours ou moins, la frise passe en barres verticales.",
+      "Dates affichées au format jj-mm-aaaa.",
+    ],
+  },
+  {
+    t: "4. Marquer et rechercher",
+    items: [
+      "Marquer : attribuez un marqueur, une couleur et une note à une ligne. Les éléments marqués sont regroupés dans Résultats › Éléments marqués.",
+      "Recherche globale : cherche un terme dans tous les artefacts chargés.",
+      "Résultats › Recherches / mots-clés : n'affiche que les éléments marqués issus des recherches, avec le nombre de tagués et de trouvés.",
+    ],
+  },
+  {
+    t: "5. Carte et fuseaux",
+    items: [
+      "Géolocalisations : carte Leaflet, liens OpenStreetMap cliquables.",
+      "Heatmap : répartition horaire selon le fuseau choisi (24 h).",
+    ],
+  },
+  {
+    t: "6. Rapport et exports",
+    items: [
+      "Rapport HTML ou PDF horodaté, avec les éléments marqués et les recherches par mots-clés.",
+      "Chaque export porte son empreinte SHA-256. Les vues « Éléments marqués » et « Recherches / mots-clés » s'exportent via le rapport.",
+    ],
+  },
+  {
+    t: "7. Fonctions particulières",
+    items: [
+      "Mots de passe Firefox : déchiffrement de key4.db et logins.json, sur copie uniquement. Mot de passe maître optionnel. Un champ affiché « <erreur : …> » indique un échec.",
+      "Mots de passe Chromium : liste des identifiants (URL, identifiant, état du mot de passe) par navigateur. Les mots de passe ne sont pas déchiffrés : Chrome et Edge récents utilisent un chiffrement lié au service du navigateur.",
+      "Carving SQLite : récupération de lignes supprimées dans les bases chargées.",
+      "IOC : chargement d'une liste d'indicateurs à croiser avec les artefacts.",
+    ],
+  },
+  {
+    t: "8. Principes",
+    items: [
+      "Lecture seule : les sources ne sont jamais modifiées. Les fichiers -wal et -shm sont copiés avec leur base.",
+      "Empreintes SHA-256 pour les sources et les exports. Horodatages convertis depuis le référentiel de chaque navigateur.",
+    ],
+  },
+];
+
 // signature stable d'une ligne (independante du fuseau), pour le marquage
 function rowSig(r: Row, columns: string[]): string {
   return columns
@@ -793,7 +863,10 @@ function rowTimeMs(r: Row): number | null {
 export function App() {
   const [over, setOver] = useState<Overview[]>([]);
   const [groups, setGroups] = useState<BrowserGroup[]>([]);
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // Éléments d'identité : bloc et catégories fermés par défaut.
+  const [collapsed, setCollapsed] = useState<Set<string>>(
+    () => new Set(["identity", ...IDENT_GROUPS.map((g) => "identity:" + g.key), "passwords"])
+  );
   const [sel, setSel] = useState<Selection | null>(null);
   const [view, setView] = useState<View | null>(null);
   const [theme, setTheme] = useState<string>("clair");
@@ -1015,6 +1088,16 @@ export function App() {
         const v = await api.firefoxPasswords(fxPwd, fxDir);
         refreshResCounts();
         setView({ title: "Mots de passe Firefox (déchiffrés)", sha: "—", ...v });
+      } else if (sel.kind === "chrpasswords") {
+        const v = await api.chromiumPasswords();
+        const rows = v.rows.filter((r) => cellText(r.values["Navigateur"]) === sel.browser);
+        refreshResCounts();
+        setView({
+          title: `Mots de passe ${sel.browser} (${rows.length}) — non déchiffrés`,
+          sha: "—",
+          columns: v.columns,
+          rows,
+        });
       } else if (sel.kind === "ioc") {
         const v = await api.iocResults();
         setView({ title: "Correspondances IOC", sha: "—", ...v });
@@ -1944,11 +2027,57 @@ export function App() {
                 onClick={() => setSel({ kind: "kwresults" })}
                 title="Éléments marqués issus des recherches par mots-clés et de la recherche globale"
               >🔑 Recherches / mots-clés ({tags.filter((t) => KW_ORIGINS.includes(tagOrigin(t))).length} tagués · {kwFound + Object.values(searchFound).reduce((a, b) => a + b, 0)} trouvés)</div>
-              <div
-                className={"node top" + (sel?.kind === "fxpasswords" ? " sel" : "")}
-                onClick={() => { setFxPromptVal(fxPwd); setShowFxPrompt(true); }}
-                title="Déchiffre les mots de passe enregistrés dans Firefox (key4.db + logins.json)"
-              >🔓 Mots de passe Firefox ({resCounts.fxpasswords ?? 0})</div>
+              {(() => {
+                const chrKeys = Object.keys(resCounts).filter((k) => k.startsWith("chr:"));
+                const total =
+                  (resCounts.fxpasswords ?? 0) +
+                  chrKeys.reduce((a, k) => a + (resCounts[k] ?? 0), 0);
+                const pwOpen = !collapsed.has("passwords");
+                return (
+                  <>
+                    <div
+                      className="node top"
+                      onClick={() =>
+                        setCollapsed((prev) => {
+                          const n = new Set(prev);
+                          if (n.has("passwords")) n.delete("passwords");
+                          else n.add("passwords");
+                          return n;
+                        })
+                      }
+                      title="Identifiants enregistrés dans les navigateurs"
+                    >
+                      <span className="chev">{pwOpen ? "▾" : "▸"}</span>🔐 Mots de passe ({total})
+                    </div>
+                    {pwOpen && (
+                      <>
+                        <div
+                          className={"node child" + (sel?.kind === "fxpasswords" ? " sel" : "")}
+                          onClick={() => { setFxPromptVal(fxPwd); setShowFxPrompt(true); }}
+                          title="Déchiffre les mots de passe enregistrés dans Firefox (key4.db + logins.json)"
+                        >🦊 Firefox ({resCounts.fxpasswords ?? 0})</div>
+                        {chrKeys.map((k) => {
+                          const browser = k.slice(4);
+                          const on = sel?.kind === "chrpasswords" && sel.browser === browser;
+                          return (
+                            <div
+                              key={k}
+                              className={"node child" + (on ? " sel" : "")}
+                              onClick={() => setSel({ kind: "chrpasswords", browser })}
+                              title="Métadonnées des identifiants Chromium : mots de passe non déchiffrés"
+                            >🌐 {browser} ({resCounts[k] ?? 0})</div>
+                          );
+                        })}
+                        <div
+                          className="node child"
+                          style={{ opacity: 0.6 }}
+                          title="IE et Edge Legacy stockent leurs mots de passe dans le registre et le coffre Windows : non pris en charge"
+                        >IE / Edge Legacy : non pris en charge</div>
+                      </>
+                    )}
+                  </>
+                );
+              })()}
               <div
                 className={"node top" + (sel?.kind === "ioc" ? " sel" : "")}
                 onClick={() => setSel({ kind: "ioc" })}
@@ -2378,6 +2507,19 @@ export function App() {
               <div className="k">Auteur</div>
               <div className="v">SCHMITT Franck</div>
             </div>
+            <hr />
+            <div className="k">Guide d'utilisation</div>
+            {HELP_GUIDE.map((g) => (
+              <div className="field" key={g.t}>
+                <div className="k">{g.t}</div>
+                <div className="v">
+                  {g.items.map((it, i) => (
+                    <div key={i}>• {it}</div>
+                  ))}
+                </div>
+              </div>
+            ))}
+            <hr />
             <div className="field">
               <div className="k">Principe forensique</div>
               <div className="v">

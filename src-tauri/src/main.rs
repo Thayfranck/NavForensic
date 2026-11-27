@@ -755,6 +755,10 @@ fn results_counts(
         m.insert("heatmap".to_string(), ev);
         m.insert("ioc".to_string(), lock_kw(iocres).len());
         m.insert("fxpasswords".to_string(), lock_kw(fxres).len());
+        for (browser, path) in chromium_sources(&a) {
+            let n = nf::read_chromium_logins(&path).map(|v| v.len()).unwrap_or(0);
+            *m.entry(format!("chr:{browser}")).or_insert(0) += n;
+        }
         m
     })
 }
@@ -821,6 +825,75 @@ fn firefox_passwords(
         }
         *lock_kw(fxres) = rows.clone();
         Ok(ViewData { columns: cols_vec(FX_COLUMNS), rows })
+    })?
+}
+
+/// Colonnes de la vue « Mots de passe Chromium ».
+const CHR_COLUMNS: &[&str] = &[
+    "Navigateur",
+    "URL",
+    "Identifiant",
+    "Mot de passe",
+    "Créé",
+    "Dernière utilisation",
+    "Source (chemin)",
+];
+
+/// Bases Login Data Chromium des artefacts chargés : (navigateur, fichier).
+fn chromium_sources(arts: &[nf::Artifact]) -> Vec<(String, std::path::PathBuf)> {
+    let mut out: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for art in arts {
+        let p = std::path::Path::new(&art.path);
+        let is_login = p
+            .file_name()
+            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("Login Data"))
+            .unwrap_or(false);
+        if is_login && !art.browser.to_lowercase().contains("firefox") {
+            let label = if art.browser.trim().is_empty() { "Chromium".to_string() } else { art.browser.clone() };
+            if !out.iter().any(|(_, q)| q == p) {
+                out.push((label, p.to_path_buf()));
+            }
+        }
+    }
+    out
+}
+
+/// Identifiants Chromium (URL, identifiant, état du mot de passe). Les mots de
+/// passe ne sont pas déchiffrés : voir engine/src/chromium_login.rs.
+#[tauri::command]
+fn chromium_passwords(state: tauri::State<AppState>) -> Result<ViewData, String> {
+    let arts = &state.arts;
+    run(move || -> Result<ViewData, String> {
+        use nf::model::Cell;
+        let sources = chromium_sources(&lock(arts));
+        if sources.is_empty() {
+            return Err("Aucune base Login Data Chromium chargée.".into());
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for (browser, path) in &sources {
+            match nf::read_chromium_logins(path) {
+                Ok(list) => {
+                    for c in list {
+                        let mut r = Row::new();
+                        r.set("Navigateur", Cell::text(browser.clone()));
+                        r.set("URL", Cell::text(c.url));
+                        r.set("Identifiant", Cell::text(c.username));
+                        r.set("Mot de passe", Cell::text(c.state));
+                        r.set("Créé", Cell::opt_time(c.created_ms));
+                        r.set("Dernière utilisation", Cell::opt_time(c.last_used_ms));
+                        r.set("Source (chemin)", Cell::text(path.display().to_string()));
+                        r.set("_chemin", Cell::text(path.display().to_string()));
+                        rows.push(r);
+                    }
+                }
+                Err(e) => errors.push(format!("{} : {e}", path.display())),
+            }
+        }
+        if rows.is_empty() && !errors.is_empty() {
+            return Err(errors.join(" ; "));
+        }
+        Ok(ViewData { columns: cols_vec(CHR_COLUMNS), rows })
     })?
 }
 
@@ -1363,6 +1436,7 @@ fn main() {
             ioc_load,
             ioc_results_view,
             firefox_passwords,
+            chromium_passwords,
             results_counts,
             sync_accounts,
             extensions,

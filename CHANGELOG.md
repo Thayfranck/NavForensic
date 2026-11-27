@@ -4,6 +4,21 @@ Toutes les modifications notables de NavForensics sont consignées ici.
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) ;
 le versionnement suit [SemVer](https://semver.org/lang/fr/) à partir de 2.x.
 
+## [2.10.0]
+
+### Ajouté
+- **Résultats › Mots de passe** : section repliable regroupant Firefox (déchiffrement,
+  inchangé) et un sous-élément par navigateur Chromium trouvé dans les artefacts.
+- **Identifiants Chromium** : URL, identifiant, date de création et de dernière
+  utilisation, et état du mot de passe. Les mots de passe ne sont **pas déchiffrés** :
+  les entrées `v20` (Chrome 127 et plus récent, chiffrement « app-bound ») ne se
+  déchiffrent pas hors ligne.
+- Éléments d'identité repliés par défaut.
+
+### Limites
+- IE et Edge Legacy : mots de passe dans le registre et le coffre Windows, non pris en charge.
+- Déchiffrement DPAPI des entrées `v10` : non implémenté, à valider sur un profil de test.
+
 ## [2.9.0]
 
 ### Ajouté

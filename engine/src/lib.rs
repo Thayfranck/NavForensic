@@ -7,6 +7,7 @@ pub mod db;
 pub mod ese;
 pub mod model;
 pub mod carve;
+pub mod chromium_login;
 pub mod crypto;
 pub mod e01;
 pub mod firefox_login;
@@ -27,6 +28,7 @@ pub use taxonomy::{
 };
 pub use crypto::{build_crypto, CRYPTO_COLUMNS};
 pub use firefox_login::{decrypt_profile, FxLogin};
+pub use chromium_login::{read_logins as read_chromium_logins, ChrLogin};
 pub use ioc::{build_ioc_matches, parse_iocs, Ioc, IOC_COLUMNS};
 pub use profiles::{build_extensions, build_sync_accounts, EXT_COLUMNS, SYNC_COLUMNS};
 pub use views::{

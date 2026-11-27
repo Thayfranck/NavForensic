@@ -174,6 +174,7 @@ export const api = {
   iocLoad: (path: string) => invoke<ViewData>("ioc_load", { path }),
   iocResults: () => invoke<ViewData>("ioc_results_view"),
   resultsCounts: () => invoke<Record<string, number>>("results_counts"),
+  chromiumPasswords: () => invoke<ViewData>("chromium_passwords"),
   firefoxPasswords: (masterPassword: string, dir?: string | null) =>
     invoke<ViewData>("firefox_passwords", { masterPassword, dir: dir ?? null }),
   syncAccounts: () => invoke<ViewData>("sync_accounts"),

@@ -1,4 +1,4 @@
-# NavForensics 2.9.0 (Tauri + React)
+# NavForensics 2.10.0 (Tauri + React)
 
 NavForensics est une application de bureau forensique écrite en Rust (Tauri 2) + React/TypeScript. Elle lit **en lecture seule** les bases de données des navigateurs extraites via X-Ways ou d'une image E01 (Chromium, Firefox, Safari, Internet Explorer / Edge Legacy, sur bureau comme sur mobile), en tire des vues d'analyse (chronologie interactive, domaines, identité, géolocalisations, téléchargements, VPN, crypto-actifs, mots de passe Firefox, etc.), **récupère les enregistrements supprimés** par carving SQLite, et génère un rapport horodaté — **HTML ou PDF** — avec empreinte **SHA-256** pour chaque export.
 

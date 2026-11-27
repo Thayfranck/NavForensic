@@ -1,10 +1,11 @@
 //! Extraction des artefacts de navigateurs depuis une image forensique E01.
 //!
 //! Chaîne : image EWF/E01 (`ewf`) → table de partitions (MBR/GPT) → volume
-//! NTFS (`ntfs-core`, lecture seule) → copie des fichiers de profil des
-//! navigateurs vers un répertoire temporaire, qui sont ensuite chargés comme
-//! des sources ordinaires. Prend aussi en charge une image brute (`.dd`,
-//! `.001`, `.raw`).
+//! NTFS (`ntfs-core`) ou ext4 (`ext4-view`), tous deux en lecture seule →
+//! copie des fichiers de profil des navigateurs vers un répertoire temporaire,
+//! qui sont ensuite chargés comme des sources ordinaires. Prend aussi en charge
+//! une image brute (`.dd`, `.001`, `.raw`). APFS et F2FS sont détectés mais
+//! non lus.
 //!
 //! Note : le lecteur EWF et le lecteur NTFS sont des bibliothèques dédiées ;
 //! l'arborescence des profils (Users/AppData/…) est parcourue de façon
@@ -14,6 +15,7 @@ use crate::model::Artifact;
 use ewf::EwfReader;
 use ntfs_core::fs::NtfsFs;
 use ntfs_core::source::OffsetReader;
+use ext4_view::{Ext4, Ext4Read};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -63,8 +65,8 @@ impl Image {
 }
 
 /// Lecteur Read+Seek sur une partition donnée (fenêtre dans l'image).
-fn open_ntfs(img: &Image, base: u64, len: u64) -> R<NtfsFs<OffsetReaderAny>> {
-    let reader = match img {
+fn open_window(img: &Image, base: u64, len: u64) -> R<OffsetReaderAny> {
+    Ok(match img {
         Image::Ewf(p) => {
             let r = EwfReader::open(p).map_err(|e| e.to_string())?;
             OffsetReaderAny::Ewf(OffsetReader::new(r, base, len).map_err(|e| e.to_string())?)
@@ -73,8 +75,33 @@ fn open_ntfs(img: &Image, base: u64, len: u64) -> R<NtfsFs<OffsetReaderAny>> {
             let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
             OffsetReaderAny::Raw(OffsetReader::new(f, base, len).map_err(|e| e.to_string())?)
         }
-    };
+    })
+}
+
+fn open_ntfs(img: &Image, base: u64, len: u64) -> R<NtfsFs<OffsetReaderAny>> {
+    let reader = open_window(img, base, len)?;
     NtfsFs::open(reader).map_err(|e| e.to_string())
+}
+
+/// Adaptateur : `ext4-view` lit par offset absolu dans la partition.
+struct ExtReader(OffsetReaderAny);
+
+impl Ext4Read for ExtReader {
+    fn read(
+        &mut self,
+        start_byte: u64,
+        dst: &mut [u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.0.seek(SeekFrom::Start(start_byte))?;
+        self.0.read_exact(dst)?;
+        Ok(())
+    }
+}
+
+/// Ouvre un volume ext2/3/4 en lecture seule.
+fn open_ext4(img: &Image, base: u64, len: u64) -> R<Ext4> {
+    let reader = open_window(img, base, len)?;
+    Ext4::load(Box::new(ExtReader(reader))).map_err(|e| e.to_string())
 }
 
 /// Enveloppe les deux types de fenêtres de partition derrière Read+Seek.
@@ -109,13 +136,14 @@ fn le64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// Repère les partitions NTFS (base en octets, longueur en octets).
-fn ntfs_partitions(img: &Image) -> Vec<(u64, u64)> {
+/// Partitions (base, longueur) dont la signature satisfait `want`, en MBR ou GPT.
+/// Longueur 0 = inconnue (image de partition unique, à l'offset 0).
+fn partitions_where(img: &Image, want: fn(&Image, u64) -> bool) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut mbr = [0u8; 512];
     if img.read_at(0, &mut mbr).is_err() || mbr[510] != 0x55 || mbr[511] != 0xAA {
-        // Pas de MBR : tenter un volume NTFS à l'offset 0 (image de partition).
-        if is_ntfs(img, 0) {
+        // Pas de MBR : tenter un volume à l'offset 0 (image de partition).
+        if want(img, 0) {
             out.push((0, 0));
         }
         return out;
@@ -130,21 +158,22 @@ fn ntfs_partitions(img: &Image) -> Vec<(u64, u64)> {
             gpt = true;
             break;
         }
-        if size > 0 && is_ntfs(img, start * SECTOR) {
+        if size > 0 && want(img, start * SECTOR) {
             out.push((start * SECTOR, size * SECTOR));
         }
     }
     if gpt {
-        out.extend(gpt_partitions(img));
+        out.extend(gpt_where(img, want));
     }
     // À défaut, tenter l'offset 0 (image de partition unique).
-    if out.is_empty() && is_ntfs(img, 0) {
+    if out.is_empty() && want(img, 0) {
         out.push((0, 0));
     }
     out
 }
 
-fn gpt_partitions(img: &Image) -> Vec<(u64, u64)> {
+/// Partitions GPT dont la signature satisfait `want`.
+fn gpt_where(img: &Image, want: fn(&Image, u64) -> bool) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut hdr = [0u8; 512];
     if img.read_at(SECTOR, &mut hdr).is_err() || &hdr[0..8] != b"EFI PART" {
@@ -168,7 +197,7 @@ fn gpt_partitions(img: &Image) -> Vec<(u64, u64)> {
             continue;
         }
         let base = first * SECTOR;
-        if is_ntfs(img, base) {
+        if want(img, base) {
             out.push((base, (last - first + 1) * SECTOR));
         }
     }
@@ -178,6 +207,24 @@ fn gpt_partitions(img: &Image) -> Vec<(u64, u64)> {
 fn is_ntfs(img: &Image, base: u64) -> bool {
     let mut b = [0u8; 16];
     img.read_at(base, &mut b).is_ok() && &b[3..11] == b"NTFS    "
+}
+
+/// ext2/3/4 : magic 0xEF53 dans le superbloc (offset 1024), champ à +56.
+fn is_ext4(img: &Image, base: u64) -> bool {
+    let mut b = [0u8; 2];
+    img.read_at(base + 1080, &mut b).is_ok() && b == [0x53, 0xEF]
+}
+
+/// APFS (iOS, macOS) : magic « NXSB » du superbloc de conteneur à l'offset 32.
+fn is_apfs(img: &Image, base: u64) -> bool {
+    let mut b = [0u8; 4];
+    img.read_at(base + 32, &mut b).is_ok() && &b == b"NXSB"
+}
+
+/// F2FS (Android récent) : magic 0xF2F52010 au superbloc (offset 1024).
+fn is_f2fs(img: &Image, base: u64) -> bool {
+    let mut b = [0u8; 4];
+    img.read_at(base + 1024, &mut b).is_ok() && b == [0x10, 0x20, 0xF5, 0xF2]
 }
 
 // --- Parcours des profils --------------------------------------------------
@@ -355,20 +402,143 @@ fn extract_volume(fs: &NtfsFs<OffsetReaderAny>, out: &Path, extracted: &mut Vec<
     }
 }
 
+// --- Volumes ext4 (Android) ------------------------------------------------
+
+/// Copie un fichier ext4 vers `dest` s'il existe et tient dans le plafond.
+fn grab_ext4(ext: &Ext4, path: &str, dest: &Path) -> bool {
+    match ext.metadata(path) {
+        Ok(m) if m.len() > 0 && m.len() as usize <= MAX_FILE => {}
+        _ => return false,
+    }
+    let data = match ext.read(path) {
+        Ok(d) if !d.is_empty() => d,
+        _ => return false,
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(dest, data).is_ok()
+}
+
+/// Fichier ext4 et ses sidecars -wal/-shm.
+fn grab_ext4_with_sidecars(ext: &Ext4, src: &str, dest: &Path) -> bool {
+    let ok = grab_ext4(ext, src, dest);
+    if ok {
+        for sfx in ["-wal", "-shm"] {
+            let d = dest.with_file_name(format!(
+                "{}{}",
+                dest.file_name().unwrap().to_string_lossy(),
+                sfx
+            ));
+            grab_ext4(ext, &format!("{src}{sfx}"), &d);
+        }
+    }
+    ok
+}
+
+/// Paquets Android : (paquet, sous-dossier du profil sous le dossier de données).
+/// Les chemins Opera et Samsung sont à vérifier sur image réelle.
+const ANDROID_CHROMIUM: &[(&str, &str)] = &[
+    ("com.android.chrome", "app_chrome/Default"),
+    ("com.microsoft.emmx", "app_chrome/Default"),
+    ("com.sec.android.app.sbrowser", "app_sbrowser/Default"),
+    ("com.opera.browser", "app_opera/Default"),
+    ("com.opera.gx", "app_opera/Default"),
+];
+/// Racines de données applicatives : `/data/data` puis `/data/user/0`.
+const ANDROID_ROOTS: &[&str] = &["/data/data", "/data/user/0"];
+
+/// Extrait les profils de navigateurs Android d'un volume ext4.
+fn extract_android(ext: &Ext4, out: &Path, extracted: &mut Vec<PathBuf>) {
+    for (pkg, rel) in ANDROID_CHROMIUM {
+        for root in ANDROID_ROOTS {
+            let before = extracted.len();
+            let base = format!("{root}/{pkg}/{rel}");
+            let dir = out.join("android").join(pkg);
+            for f in CHROMIUM_FILES {
+                let dest = dir.join(f);
+                if grab_ext4_with_sidecars(ext, &format!("{base}/{f}"), &dest) {
+                    extracted.push(dest);
+                }
+            }
+            let dest = dir.join("Cookies-Network");
+            if grab_ext4(ext, &format!("{base}/Network/Cookies"), &dest) {
+                extracted.push(dest);
+            }
+            if extracted.len() > before {
+                break;
+            }
+        }
+    }
+
+    // Firefox Android : files/mozilla/<profil>/.
+    for root in ANDROID_ROOTS {
+        let before = extracted.len();
+        let pkg = "org.mozilla.firefox";
+        let ff = format!("{root}/{pkg}/files/mozilla");
+        if let Ok(entries) = ext.read_dir(ff.as_str()) {
+            for entry in entries.flatten() {
+                let name = match entry.file_name().as_str() {
+                    Ok(n) if n != "." && n != ".." => n.to_string(),
+                    _ => continue,
+                };
+                for f in FIREFOX_FILES {
+                    let dest = out.join("android").join(pkg).join(&name).join(f);
+                    if grab_ext4_with_sidecars(ext, &format!("{ff}/{name}/{f}"), &dest) {
+                        extracted.push(dest);
+                    }
+                }
+            }
+        }
+        if extracted.len() > before {
+            break;
+        }
+    }
+}
+
 /// Extrait les fichiers de profil de navigateur d'une image E01 (ou brute)
 /// vers `out_dir`. Renvoie les chemins extraits.
+///
+/// Volumes lus : NTFS (Windows) et ext4 (Android). APFS (iOS, macOS) et F2FS
+/// (Android récent) sont détectés mais non lus : un message explicite est
+/// renvoyé lorsque rien n'a pu être extrait.
 pub fn extract_browser_files(image_path: &str, out_dir: &Path) -> R<Vec<PathBuf>> {
     let img = Image::detect(Path::new(image_path));
-    let parts = ntfs_partitions(&img);
-    if parts.is_empty() {
-        return Err("Aucun volume NTFS trouvé dans l'image.".into());
-    }
+    let ntfs = partitions_where(&img, is_ntfs);
+    let ext = partitions_where(&img, is_ext4);
+    let apfs = partitions_where(&img, is_apfs);
+    let f2fs = partitions_where(&img, is_f2fs);
     let mut extracted = Vec::new();
-    for (base, len) in parts {
+    for (base, len) in ntfs.iter().copied() {
         // Longueur inconnue (image de partition) -> fenêtre très large.
         let len = if len == 0 { u64::MAX / 2 } else { len };
         if let Ok(fs) = open_ntfs(&img, base, len) {
             extract_volume(&fs, out_dir, &mut extracted);
+        }
+    }
+    for (base, len) in ext.iter().copied() {
+        let len = if len == 0 { u64::MAX / 2 } else { len };
+        if let Ok(fs) = open_ext4(&img, base, len) {
+            extract_android(&fs, out_dir, &mut extracted);
+        }
+    }
+    if extracted.is_empty() && ntfs.is_empty() {
+        if !apfs.is_empty() {
+            return Err(
+                "Volume APFS détecté (iOS ou macOS) : sa lecture n'est pas prise en charge, \
+                 aucun profil extrait."
+                    .into(),
+            );
+        }
+        if !f2fs.is_empty() {
+            return Err(
+                "Volume F2FS détecté (Android récent) : sa lecture n'est pas prise en charge, \
+                 aucun profil extrait."
+                    .into(),
+            );
+        }
+        if ext.is_empty() {
+            return Err("Aucun volume NTFS ou ext4 reconnu dans l'image.".into());
         }
     }
     Ok(extracted)

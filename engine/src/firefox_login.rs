@@ -43,10 +43,13 @@ const CKA_ID: [u8; 16] = [
 // OID (contenu DER, sans le tag/longueur).
 const OID_3DES_PBE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x05, 0x01, 0x03];
 const OID_PBES2: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x05, 0x0d];
+/// AES-256-CBC (2.16.840.1.101.3.4.1.42) : chiffrement des champs logins récents.
+const OID_AES256_CBC: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a];
 
 // --- Lecteur DER minimal (tag, longueur, valeur) ---------------------------
 
 struct Tlv<'a> {
+    tag: u8,
     content: &'a [u8],
 }
 
@@ -74,7 +77,7 @@ fn read_tlv(b: &[u8]) -> Result<(Tlv<'_>, &[u8]), String> {
     if b.len() < i + len {
         return Err("DER tronqué".into());
     }
-    Ok((Tlv { content: &b[i..i + len] }, &b[i + len..]))
+    Ok((Tlv { tag: b[0], content: &b[i..i + len] }, &b[i + len..]))
 }
 
 /// Découpe le contenu d'une SEQUENCE en ses éléments TLV successifs.
@@ -234,7 +237,50 @@ fn decrypt_pbe_entry(global_salt: &[u8], master_pw: &[u8], der: &[u8]) -> Result
 
 // --- Extraction de la clé maîtresse depuis key4.db -------------------------
 
-fn master_key(db: &ReadOnlyDb, master_pw: &[u8]) -> Result<Vec<u8>, String> {
+/// Candidats de clé dans le contenu déchiffré de a11 : le buffer entier s'il
+/// fait 24 ou 32 octets, puis tout OCTET STRING de 24 ou 32 octets trouvé dans
+/// une structure DER (parcours récursif des SEQUENCE). Le bon candidat est
+/// choisi plus tard, en vérifiant qu'il déchiffre réellement un identifiant.
+fn collect_key_candidates(buf: &[u8], out: &mut Vec<Vec<u8>>, depth: u8) {
+    if (buf.len() == 24 || buf.len() == 32) && !out.iter().any(|k| k == buf) {
+        out.push(buf.to_vec());
+    }
+    if depth > 4 {
+        return;
+    }
+    let mut rest = buf;
+    while rest.len() >= 2 {
+        let Ok((tlv, next)) = read_tlv(rest) else { break };
+        if tlv.tag == 0x04 && (tlv.content.len() == 24 || tlv.content.len() == 32) {
+            if !out.iter().any(|k| k == tlv.content) {
+                out.push(tlv.content.to_vec());
+            }
+        } else if tlv.tag == 0x30 {
+            collect_key_candidates(tlv.content, out, depth + 1);
+        }
+        rest = next;
+    }
+}
+
+/// Squelette DER (tags et longueurs uniquement, sans valeurs) pour diagnostic.
+fn der_skeleton(buf: &[u8]) -> String {
+    let mut out = Vec::new();
+    let mut rest = buf;
+    while rest.len() >= 2 && out.len() < 12 {
+        let Ok((tlv, next)) = read_tlv(rest) else { break };
+        let consumed = rest.len() - next.len();
+        let hdr = consumed - tlv.content.len();
+        out.push(format!("tag {:02x} len {}", tlv.tag, tlv.content.len()));
+        if tlv.tag == 0x30 {
+            out.push(format!("[{}]", der_skeleton(tlv.content)));
+        }
+        let _ = hdr;
+        rest = next;
+    }
+    out.join(", ")
+}
+
+fn master_key(db: &ReadOnlyDb, master_pw: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let (global_salt, item2): (Vec<u8>, Vec<u8>) = db
         .conn
         .query_row(
@@ -283,10 +329,28 @@ fn master_key(db: &ReadOnlyDb, master_pw: &[u8]) -> Result<Vec<u8>, String> {
     }
     let a11 = a11.ok_or("Clé maîtresse absente de key4.db (nssPrivate).")?;
     let decrypted = decrypt_pbe_entry(&global_salt, master_pw, &a11)?;
-    if decrypted.len() < 24 {
-        return Err("Clé maîtresse de taille inattendue.".into());
+    let mut cands = Vec::new();
+    collect_key_candidates(&decrypted, &mut cands, 0);
+    // Structure inconnue : toute fenêtre de 24 ou 32 octets, à chaque décalage.
+    // Le choix final se fait par déchiffrement d'un identifiant réel.
+    for len in [24usize, 32] {
+        if decrypted.len() >= len {
+            for off in 0..=decrypted.len() - len {
+                let w = &decrypted[off..off + len];
+                if !cands.iter().any(|k| k == w) {
+                    cands.push(w.to_vec());
+                }
+            }
+        }
     }
-    Ok(decrypted[..24].to_vec())
+    if cands.is_empty() {
+        return Err(format!(
+            "Clé maîtresse non reconnue ({} octets déchiffrés, en-têtes : {}).",
+            decrypted.len(),
+            der_skeleton(&decrypted)
+        ));
+    }
+    Ok(cands)
 }
 
 // --- Déchiffrement d'un champ de logins.json --------------------------------
@@ -302,11 +366,16 @@ fn decrypt_login_field(master_key: &[u8], b64: &str) -> Result<String, String> {
         return Err("entrée login : structure inattendue".into());
     }
     let algo = seq_items(items[1].content)?;
+    let oid = algo.first().ok_or("entrée login : OID absent")?.content;
     let iv = algo.get(1).ok_or("entrée login : iv absent")?.content;
     let ct = items[2].content;
-    let pt = cbc_3des_decrypt(master_key, iv, ct)?;
-    let pt = strip_pkcs7(pt, 8);
-    Ok(String::from_utf8_lossy(&pt).into_owned())
+    // L'OID choisit l'algorithme : AES-256-CBC (profils récents) ou 3DES-CBC.
+    let pt = if oid == OID_AES256_CBC {
+        strip_pkcs7(cbc_aes256_decrypt(master_key, iv, ct)?, 16)
+    } else {
+        strip_pkcs7(cbc_3des_decrypt(master_key, iv, ct)?, 8)
+    };
+    String::from_utf8(pt).map_err(|_| "texte non UTF-8 (mauvaise clé)".to_string())
 }
 
 // --- API publique -----------------------------------------------------------
@@ -323,7 +392,7 @@ pub fn decrypt_profile(profile_dir: &Path, master_pw: &str) -> Result<Vec<FxLogi
         return Err(format!("logins.json introuvable dans {}", profile_dir.display()));
     }
     let db = ReadOnlyDb::open(&key4)?;
-    let mk = master_key(&db, master_pw.as_bytes())?;
+    let cands = master_key(&db, master_pw.as_bytes())?;
 
     let text = std::fs::read_to_string(&logins).map_err(|e| e.to_string())?;
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -331,6 +400,21 @@ pub fn decrypt_profile(profile_dir: &Path, master_pw: &str) -> Result<Vec<FxLogi
         .get("logins")
         .and_then(|v| v.as_array())
         .ok_or("logins.json : clé « logins » absente")?;
+
+    // Choix de la clé : le premier candidat qui déchiffre un identifiant réel.
+    let sample = arr.iter().find_map(|it| {
+        let u = it.get("encryptedUsername").and_then(|v| v.as_str())?;
+        let p = it.get("encryptedPassword").and_then(|v| v.as_str())?;
+        Some((u.to_string(), p.to_string()))
+    });
+    let mk: Vec<u8> = match &sample {
+        None => cands[0].clone(),
+        Some((u, p)) => cands
+            .iter()
+            .find(|k| decrypt_login_field(k, u).is_ok() || decrypt_login_field(k, p).is_ok())
+            .cloned()
+            .ok_or("Clé maîtresse : aucun candidat ne déchiffre les identifiants.")?,
+    };
 
     let mut out = Vec::new();
     for item in arr {
@@ -407,6 +491,53 @@ mod tests {
             .encrypt_padded_vec_mut::<NoPadding>(&pt);
         let back = cbc_aes256_decrypt(&key, &iv, &ct).unwrap();
         assert_eq!(&back, &pt);
+    }
+
+    #[test]
+    fn login_field_aes256() {
+        use cipher::BlockEncryptMut;
+        type EncAes = cbc::Encryptor<aes::Aes256>;
+        let key = [5u8; 32];
+        let iv = [3u8; 16];
+        // Texte clair « secret » + rembourrage PKCS#7 sur un bloc de 16.
+        let mut pt = b"secret".to_vec();
+        pt.extend(std::iter::repeat(10u8).take(10));
+        let ct = EncAes::new_from_slices(&key, &iv)
+            .unwrap()
+            .encrypt_padded_vec_mut::<NoPadding>(&pt);
+        // DER : SEQUENCE { OCTET keyId, SEQUENCE { OID aes256, OCTET iv }, OCTET ct }
+        let mut algo = vec![0x06, OID_AES256_CBC.len() as u8];
+        algo.extend_from_slice(OID_AES256_CBC);
+        algo.extend([0x04, iv.len() as u8]);
+        algo.extend_from_slice(&iv);
+        let mut algo_seq = vec![0x30, algo.len() as u8];
+        algo_seq.extend(algo);
+        let mut body = vec![0x04, 0x02, 0x01, 0x02];
+        body.extend(algo_seq);
+        body.extend([0x04, ct.len() as u8]);
+        body.extend(&ct);
+        let mut der = vec![0x30, body.len() as u8];
+        der.extend(body);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&der);
+        assert_eq!(decrypt_login_field(&key, &b64).unwrap(), "secret");
+    }
+
+    #[test]
+    fn key_candidates_from_der() {
+        // SEQUENCE { SEQUENCE { OID 1.2 }, OCTET STRING (32 octets) } = 48 octets.
+        let mut inner = vec![0x30, 0x03, 0x06, 0x01, 0x2a];
+        inner.extend([0x04, 0x20]);
+        inner.extend([0xabu8; 32]);
+        let mut der = vec![0x30, inner.len() as u8];
+        der.extend(&inner);
+        let mut cands = Vec::new();
+        collect_key_candidates(&der, &mut cands, 0);
+        assert_eq!(cands, vec![vec![0xabu8; 32]]);
+
+        // Un buffer brut de 48 octets ne produit aucun candidat.
+        let mut none = Vec::new();
+        collect_key_candidates(&[0x11u8; 48], &mut none, 0);
+        assert!(none.is_empty());
     }
 
     #[test]

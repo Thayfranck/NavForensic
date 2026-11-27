@@ -1,6 +1,6 @@
 [package]
 name = "navforensics-engine"
-version = "2.8.0"
+version = "2.10.0"
 edition = "2021"
 description = "Coeur d'analyse forensique des bases de navigateurs (NavForensics)"
 
@@ -17,6 +17,7 @@ flate2 = "1"
 ese-core = "0.2"
 ewf = "0.4"
 ntfs-core = "0.10"
+ext4-view = "1.0"
 printpdf = "0.7"
 regex = "1"
 tempfile = "3"
